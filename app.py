@@ -171,7 +171,7 @@ st.sidebar.header("필터")
 
 view_mode = st.sidebar.radio(
     "분석 기준 선택",
-    ["전체 기간", "월별", "날짜별"]
+    ["전체 기간", "월별", "날짜별", "시계열 분석"]
 )
 
 # =========================
@@ -306,3 +306,91 @@ else:
 
     st.subheader("날짜별 데이터 표")
     st.dataframe(data, width="stretch")
+
+# =========================
+# 시계열 분석 화면
+# =========================
+
+elif view_mode == "시계열 분석":
+    st.subheader("시계열 분석")
+
+    # 날짜별 전체 여의동 종료 건수
+    daily_total = (
+        daily_df.groupby("기준_날짜", as_index=False)
+        .agg({
+            "전체_건수": "sum",
+            "전체_이용_분": "sum",
+            "전체_이용_거리": "sum"
+        })
+        .sort_values("기준_날짜")
+    )
+
+    # 7일 이동평균
+    daily_total["7일_이동평균"] = daily_total["전체_건수"].rolling(window=7).mean()
+
+    st.markdown("### 여의동 전체 일별 종료 건수 추이")
+
+    fig_daily = px.line(
+        daily_total,
+        x="기준_날짜",
+        y=["전체_건수", "7일_이동평균"],
+        title="여의동 전체 일별 종료 건수 및 7일 이동평균"
+    )
+
+    st.plotly_chart(fig_daily, width="stretch")
+
+    st.divider()
+
+    # 월별 전체 추이
+    monthly_total = (
+        monthly_df.groupby("월", as_index=False)
+        .agg({
+            "전체_건수": "sum",
+            "전체_이용_분": "sum",
+            "전체_이용_거리": "sum"
+        })
+        .sort_values("월")
+    )
+
+    st.markdown("### 월별 전체 종료 건수 추이")
+
+    fig_monthly = px.line(
+        monthly_total,
+        x="월",
+        y="전체_건수",
+        markers=True,
+        title="여의동 월별 전체 종료 건수 추이"
+    )
+
+    st.plotly_chart(fig_monthly, width="stretch")
+
+    st.divider()
+
+    # 대여소별 시계열
+    st.markdown("### 대여소별 일별 종료 건수 추이")
+
+    station_list = sorted(daily_df["종료_대여소명"].dropna().unique())
+
+    selected_station = st.selectbox(
+        "대여소 선택",
+        station_list
+    )
+
+    station_data = daily_df[daily_df["종료_대여소명"] == selected_station].copy()
+    station_data = station_data.sort_values("기준_날짜")
+
+    station_data["7일_이동평균"] = station_data["전체_건수"].rolling(window=7).mean()
+
+    fig_station = px.line(
+        station_data,
+        x="기준_날짜",
+        y=["전체_건수", "7일_이동평균"],
+        title=f"{selected_station} 일별 종료 건수 추이"
+    )
+
+    st.plotly_chart(fig_station, width="stretch")
+
+    st.divider()
+
+    st.markdown("### 시계열 데이터 표")
+    st.dataframe(daily_total, width="stretch")
