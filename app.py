@@ -140,12 +140,13 @@ def make_count_map(data, zoom_start=15):
 # 공통 그래프 함수
 # =========================
 
-def show_top_bar(data, title):
+def show_top_bar(data, title, key_prefix):
     top_n = st.slider(
         "상위 몇 개 대여소를 볼까요?",
         min_value=5,
         max_value=30,
-        value=10
+        value=10,
+        key=f"{key_prefix}_top_n"
     )
 
     top_data = data.sort_values("전체_건수", ascending=False).head(top_n)
@@ -195,7 +196,7 @@ if view_mode == "전체 기간":
     st.divider()
 
     st.subheader("종료 건수 상위 대여소")
-    show_top_bar(data, "전체 기간 종료 건수 상위 대여소")
+    show_top_bar(data, "전체 기간 종료 건수 상위 대여소", "total")
 
     st.divider()
 
@@ -242,7 +243,7 @@ elif view_mode == "월별":
     st.divider()
 
     st.subheader(f"{selected_month} 종료 건수 상위 대여소")
-    show_top_bar(data, f"{selected_month} 종료 건수 상위 대여소")
+    show_top_bar(data, f"{selected_month} 종료 건수 상위 대여소", "monthly")
 
     st.divider()
 
@@ -265,7 +266,7 @@ elif view_mode == "월별":
 # 날짜별 화면
 # =========================
 
-else:
+elif view_mode == "날짜별":
     st.subheader("날짜별 종료 대여소 분석")
 
     available_dates = sorted(daily_df["기준_날짜"].dropna().dt.date.unique())
@@ -289,7 +290,7 @@ else:
     st.divider()
 
     st.subheader(f"{selected_date} 종료 건수 상위 대여소")
-    show_top_bar(data, f"{selected_date} 종료 건수 상위 대여소")
+    show_top_bar(data, f"{selected_date} 종료 건수 상위 대여소", "daily")
 
     st.divider()
 
@@ -306,6 +307,7 @@ else:
 
     st.subheader("날짜별 데이터 표")
     st.dataframe(data, width="stretch")
+
 
 # =========================
 # 시계열 분석 화면
@@ -325,7 +327,6 @@ elif view_mode == "시계열 분석":
         .sort_values("기준_날짜")
     )
 
-    # 7일 이동평균
     daily_total["7일_이동평균"] = daily_total["전체_건수"].rolling(window=7).mean()
 
     st.markdown("### 여의동 전체 일별 종료 건수 추이")
