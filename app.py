@@ -48,11 +48,9 @@ def load_data():
     for df in dfs:
         df.columns = df.columns.str.strip()
 
-    # 날짜 처리
     daily["기준_날짜"] = pd.to_datetime(daily["기준_날짜"], errors="coerce")
     daily_ts["기준_날짜"] = pd.to_datetime(daily_ts["기준_날짜"], errors="coerce")
 
-    # 숫자형 처리
     numeric_cols = [
         "출발_건수", "종료_건수", "순유입량", "불균형_절댓값",
         "출발_이용_분", "종료_이용_분",
@@ -63,7 +61,7 @@ def load_data():
     for df in [daily, monthly, total, pickup, delivery, imbalance]:
         for col in numeric_cols:
             if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
     ts_numeric_cols = [
         "출발_건수", "종료_건수", "순유입량",
@@ -75,7 +73,7 @@ def load_data():
     for df in [daily_ts, monthly_ts]:
         for col in ts_numeric_cols:
             if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
     return daily, monthly, total, daily_ts, monthly_ts, pickup, delivery, imbalance
 
@@ -151,7 +149,7 @@ def show_bottom_bar(data, value_col, title, key_prefix):
     st.plotly_chart(fig, width="stretch")
 
 
-def make_value_map(data, value_col, map_title, circle_color="#2563eb", label_suffix="건"):
+def make_value_map(data, value_col, circle_color="#2563eb", label_suffix="건"):
     map_data = data.dropna(subset=["위도", "경도"]).copy()
 
     if len(map_data) == 0:
@@ -211,7 +209,6 @@ def make_value_map(data, value_col, map_title, circle_color="#2563eb", label_suf
             )
         ).add_to(m)
 
-        # 라벨: 원 색과 상관없이 항상 검정 글씨 + 흰 배경
         folium.Marker(
             location=[lat, lon],
             icon=folium.DivIcon(
@@ -220,7 +217,7 @@ def make_value_map(data, value_col, map_title, circle_color="#2563eb", label_suf
                     font-size: 10px;
                     font-weight: bold;
                     color: #111111;
-                    background-color: rgba(255,255,255,0.90);
+                    background-color: rgba(255,255,255,0.92);
                     border: 1px solid #333333;
                     border-radius: 5px;
                     padding: 1px 4px;
@@ -270,11 +267,11 @@ def make_imbalance_map(data):
         imbalance = int(row["불균형_절댓값"])
 
         if net > 0:
-            circle_color = "#dc2626"   # 빨강: 수거 후보
+            circle_color = "#dc2626"
         elif net < 0:
-            circle_color = "#2563eb"   # 파랑: 재배치 후보
+            circle_color = "#2563eb"
         else:
-            circle_color = "#6b7280"   # 회색: 균형
+            circle_color = "#6b7280"
 
         if max_imbalance > 0:
             radius = 5 + (imbalance / max_imbalance) * 22
@@ -309,7 +306,6 @@ def make_imbalance_map(data):
         else:
             label_text = f"{net:,}"
 
-        # 라벨: 빨강/파랑 원 위에서도 잘 보이도록 검정 글씨 + 흰 배경
         folium.Marker(
             location=[lat, lon],
             icon=folium.DivIcon(
@@ -342,79 +338,79 @@ def render_analysis_page(data, title_prefix, key_prefix):
 
     st.divider()
 
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "출발 대여소 분석",
-        "종료 대여소 분석",
-        "불균형 분석",
-        "데이터 표"
-    ])
+    st.markdown("## 1. 출발 대여소 분석")
 
-    with tab1:
-        st.markdown("### 출발 건수 상위 대여소")
-        show_top_bar(data, "출발_건수", f"{title_prefix} 출발 건수 상위 대여소", f"{key_prefix}_dep")
+    st.markdown("### 출발 건수 상위 대여소")
+    show_top_bar(data, "출발_건수", f"{title_prefix} 출발 건수 상위 대여소", f"{key_prefix}_dep")
 
-        st.markdown("### 출발 건수 지도")
-        dep_map = make_value_map(
-            data=data,
-            value_col="출발_건수",
-            map_title=f"{title_prefix} 출발 건수 지도",
-            circle_color="#2563eb",
-            label_suffix="건"
-        )
+    st.markdown("### 출발 건수 지도")
+    dep_map = make_value_map(
+        data=data,
+        value_col="출발_건수",
+        circle_color="#2563eb",
+        label_suffix="건"
+    )
 
-        if dep_map is not None:
-            st_folium(dep_map, width=None, height=650)
-        else:
-            st.warning("지도에 표시할 위도/경도 데이터가 없습니다.")
+    if dep_map is not None:
+        st_folium(dep_map, width=None, height=650, key=f"{key_prefix}_dep_map")
+    else:
+        st.warning("출발 지도에 표시할 위도/경도 데이터가 없습니다.")
 
-    with tab2:
-        st.markdown("### 종료 건수 상위 대여소")
-        show_top_bar(data, "종료_건수", f"{title_prefix} 종료 건수 상위 대여소", f"{key_prefix}_arr")
+    st.divider()
 
-        st.markdown("### 종료 건수 지도")
-        arr_map = make_value_map(
-            data=data,
-            value_col="종료_건수",
-            map_title=f"{title_prefix} 종료 건수 지도",
-            circle_color="#16a34a",
-            label_suffix="건"
-        )
+    st.markdown("## 2. 종료 대여소 분석")
 
-        if arr_map is not None:
-            st_folium(arr_map, width=None, height=650)
-        else:
-            st.warning("지도에 표시할 위도/경도 데이터가 없습니다.")
+    st.markdown("### 종료 건수 상위 대여소")
+    show_top_bar(data, "종료_건수", f"{title_prefix} 종료 건수 상위 대여소", f"{key_prefix}_arr")
 
-    with tab3:
-        st.markdown("### 불균형 절댓값 상위 대여소")
-        show_top_bar(data, "불균형_절댓값", f"{title_prefix} 불균형 상위 대여소", f"{key_prefix}_imb")
+    st.markdown("### 종료 건수 지도")
+    arr_map = make_value_map(
+        data=data,
+        value_col="종료_건수",
+        circle_color="#16a34a",
+        label_suffix="건"
+    )
 
-        st.markdown("### 순유입량 상위 대여소: 수거 후보")
-        pickup_data = data[data["순유입량"] > 0].copy()
-        if len(pickup_data) > 0:
-            show_top_bar(pickup_data, "순유입량", f"{title_prefix} 수거 후보 상위 대여소", f"{key_prefix}_pickup")
-        else:
-            st.info("수거 후보 데이터가 없습니다.")
+    if arr_map is not None:
+        st_folium(arr_map, width=None, height=650, key=f"{key_prefix}_arr_map")
+    else:
+        st.warning("종료 지도에 표시할 위도/경도 데이터가 없습니다.")
 
-        st.markdown("### 순유입량 하위 대여소: 재배치 후보")
-        delivery_data = data[data["순유입량"] < 0].copy()
-        if len(delivery_data) > 0:
-            show_bottom_bar(delivery_data, "순유입량", f"{title_prefix} 재배치 후보 상위 대여소", f"{key_prefix}_delivery")
-        else:
-            st.info("재배치 후보 데이터가 없습니다.")
+    st.divider()
 
-        st.markdown("### 불균형 지도")
-        st.caption("빨간색은 수거 후보(과잉), 파란색은 재배치 후보(부족), 원 크기는 불균형 절댓값을 의미합니다.")
+    st.markdown("## 3. 불균형 분석")
 
-        imb_map = make_imbalance_map(data)
+    st.markdown("### 불균형 절댓값 상위 대여소")
+    show_top_bar(data, "불균형_절댓값", f"{title_prefix} 불균형 상위 대여소", f"{key_prefix}_imb")
 
-        if imb_map is not None:
-            st_folium(imb_map, width=None, height=650)
-        else:
-            st.warning("지도에 표시할 위도/경도 데이터가 없습니다.")
+    st.markdown("### 순유입량 상위 대여소: 수거 후보")
+    pickup_data = data[data["순유입량"] > 0].copy()
+    if len(pickup_data) > 0:
+        show_top_bar(pickup_data, "순유입량", f"{title_prefix} 수거 후보 상위 대여소", f"{key_prefix}_pickup")
+    else:
+        st.info("수거 후보 데이터가 없습니다.")
 
-    with tab4:
-        st.dataframe(data, width="stretch")
+    st.markdown("### 순유입량 하위 대여소: 재배치 후보")
+    delivery_data = data[data["순유입량"] < 0].copy()
+    if len(delivery_data) > 0:
+        show_bottom_bar(delivery_data, "순유입량", f"{title_prefix} 재배치 후보 상위 대여소", f"{key_prefix}_delivery")
+    else:
+        st.info("재배치 후보 데이터가 없습니다.")
+
+    st.markdown("### 불균형 지도")
+    st.caption("빨간색은 수거 후보(과잉), 파란색은 재배치 후보(부족), 원 크기는 불균형 절댓값을 의미합니다.")
+
+    imb_map = make_imbalance_map(data)
+
+    if imb_map is not None:
+        st_folium(imb_map, width=None, height=650, key=f"{key_prefix}_imb_map")
+    else:
+        st.warning("불균형 지도에 표시할 위도/경도 데이터가 없습니다.")
+
+    st.divider()
+
+    st.markdown("## 4. 데이터 표")
+    st.dataframe(data, width="stretch")
 
 
 # =========================
