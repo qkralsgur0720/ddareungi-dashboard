@@ -21,8 +21,8 @@ st.title("🚲 여의동 따릉이 수거·재배치 분석 대시보드")
 st.markdown("""
 이 대시보드는 여의동 따릉이 이용 데이터를 바탕으로 **출발·종료 패턴, 수요 불균형, 실시간 수거·재배치 후보**를 분석합니다.
 
-- 여의동 선별 기준: 이용 데이터의 `시작_대여소명` 또는 `종료_대여소명`에 `여의동` 포함
-- 집계 기준: `대여소_ID`
+- 과거 분석 기준: 2025년 여의동 따릉이 출발·종료 데이터
+- 실시간 분석 기준: 서울시 공공자전거 실시간 대여정보 API
 - 핵심 지표: `순유입량 = 종료_건수 - 출발_건수`
 - 관리 기준: `불균형_절댓값 = |순유입량|`
 - 실시간 판단 기준: 현재 자전거 수, 거치대 수, 점유율
@@ -47,11 +47,13 @@ def load_data():
     imbalance = pd.read_excel(FILE_NAME, sheet_name="불균형_TOP")
 
     dfs = [daily, monthly, total, daily_ts, monthly_ts, pickup, delivery, imbalance]
+
     for df in dfs:
         df.columns = df.columns.str.strip()
 
     if "기준_날짜" in daily.columns:
         daily["기준_날짜"] = pd.to_datetime(daily["기준_날짜"], errors="coerce")
+
     if "기준_날짜" in daily_ts.columns:
         daily_ts["기준_날짜"] = pd.to_datetime(daily_ts["기준_날짜"], errors="coerce")
 
@@ -71,15 +73,41 @@ def load_data():
             if col in df.columns:
                 df[col] = df[col].fillna(0)
 
-    # 매칭용 ID
     for df in [daily, monthly, total, pickup, delivery, imbalance]:
         if "대여소_ID" in df.columns:
-            df["매칭_ID"] = df["대여소_ID"].astype(str).str.replace("ST-", "", regex=False).str.strip()
+            df["매칭_ID"] = (
+                df["대여소_ID"]
+                .astype(str)
+                .str.replace("ST-", "", regex=False)
+                .str.strip()
+            )
 
     return daily, monthly, total, daily_ts, monthly_ts, pickup, delivery, imbalance
 
 
 daily_df, monthly_df, total_df, daily_ts_df, monthly_ts_df, pickup_df, delivery_df, imbalance_df = load_data()
+
+# =========================
+# 세션 상태 초기화
+# =========================
+
+if "realtime_decision_df" not in st.session_state:
+    st.session_state["realtime_decision_df"] = None
+
+if "realtime_route_df" not in st.session_state:
+    st.session_state["realtime_route_df"] = None
+
+if "realtime_vrp_input_df" not in st.session_state:
+    st.session_state["realtime_vrp_input_df"] = None
+
+if "realtime_loaded_time" not in st.session_state:
+    st.session_state["realtime_loaded_time"] = None
+
+if "realtime_depot_lat" not in st.session_state:
+    st.session_state["realtime_depot_lat"] = None
+
+if "realtime_depot_lon" not in st.session_state:
+    st.session_state["realtime_depot_lon"] = None
 
 
 # =========================
@@ -96,6 +124,8 @@ def format_int(x):
 def get_station_col(df):
     if "대여소명" in df.columns:
         return "대여소명"
+    if "실시간_대여소명" in df.columns:
+        return "실시간_대여소명"
     return df.columns[0]
 
 
@@ -382,15 +412,24 @@ def fetch_realtime_bike_data(api_key):
         end = start + step - 1
         url = f"http://openapi.seoul.go.kr:8088/{api_key}/json/bikeList/{start}/{end}/"
 
-        response = requests.get(url, timeout=20)
-        response.raise_for_status()
-
-        data = response.json()
+        try:
+            response = requests.get(url, timeout=20)
+            response.raise_for_status()
+            data = response.json()
+        except Exception as e:
+            return pd.DataFrame(), {"error": str(e), "url": url}
 
         if "rentBikeStatus" not in data:
             return pd.DataFrame(), data
 
         status = data["rentBikeStatus"]
+
+        result = status.get("RESULT", {})
+        code = result.get("CODE", "")
+
+        if code and code != "INFO-000":
+            return pd.DataFrame(), data
+
         rows = status.get("row", [])
         total_count = int(status.get("list_total_count", len(rows)))
 
@@ -420,11 +459,23 @@ def fetch_realtime_bike_data(api_key):
 
     df = df.rename(columns=rename_map)
 
-    for col in ["거치대수", "현재자전거수", "거치율", "위도", "경도"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+    required_cols = ["거치대수", "실시간_대여소명", "현재자전거수", "거치율", "위도", "경도", "대여소_ID"]
 
-    df["매칭_ID"] = df["대여소_ID"].astype(str).str.replace("ST-", "", regex=False).str.strip()
+    for col in required_cols:
+        if col not in df.columns:
+            df[col] = None
+
+    for col in ["거치대수", "현재자전거수", "거치율", "위도", "경도"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["대여소_ID"] = df["대여소_ID"].astype(str).str.strip()
+
+    df["매칭_ID"] = (
+        df["대여소_ID"]
+        .astype(str)
+        .str.replace("ST-", "", regex=False)
+        .str.strip()
+    )
 
     return df, {}
 
@@ -458,12 +509,18 @@ def prepare_realtime_decision_data(
     hist = historical_df.copy()
 
     if "매칭_ID" not in hist.columns:
-        hist["매칭_ID"] = hist["대여소_ID"].astype(str).str.replace("ST-", "", regex=False).str.strip()
+        hist["매칭_ID"] = (
+            hist["대여소_ID"]
+            .astype(str)
+            .str.replace("ST-", "", regex=False)
+            .str.strip()
+        )
 
     hist_cols = [
         "매칭_ID", "대여소명", "출발_건수", "종료_건수",
         "순유입량", "불균형_절댓값", "관리유형", "주소1", "주소2"
     ]
+
     hist_cols = [col for col in hist_cols if col in hist.columns]
 
     merged = pd.merge(
@@ -474,7 +531,6 @@ def prepare_realtime_decision_data(
     )
 
     if len(merged) == 0:
-        # 이름에 여의가 들어가는 경우라도 살림
         merged = realtime_df[
             realtime_df["실시간_대여소명"].astype(str).str.contains("여의", na=False)
         ].copy()
@@ -484,16 +540,28 @@ def prepare_realtime_decision_data(
 
     merged["거치대수"] = pd.to_numeric(merged["거치대수"], errors="coerce").fillna(0)
     merged["현재자전거수"] = pd.to_numeric(merged["현재자전거수"], errors="coerce").fillna(0)
+    merged["거치율"] = pd.to_numeric(merged["거치율"], errors="coerce").fillna(0)
+    merged["위도"] = pd.to_numeric(merged["위도"], errors="coerce")
+    merged["경도"] = pd.to_numeric(merged["경도"], errors="coerce")
 
-    merged = merged[merged["거치대수"] > 0].copy()
+    merged = merged[(merged["거치대수"] > 0) & merged["위도"].notna() & merged["경도"].notna()].copy()
+
+    if len(merged) == 0:
+        return pd.DataFrame()
 
     merged["현재점유율"] = merged["현재자전거수"] / merged["거치대수"]
     merged["목표자전거수"] = (merged["거치대수"] * target_rate).round().astype(int)
 
-    merged["수거필요대수"] = (merged["현재자전거수"] - merged["목표자전거수"]).clip(lower=0).round().astype(int)
-    merged["재배치필요대수"] = (merged["목표자전거수"] - merged["현재자전거수"]).clip(lower=0).round().astype(int)
+    merged["수거필요대수"] = (
+        merged["현재자전거수"] - merged["목표자전거수"]
+    ).clip(lower=0).round().astype(int)
+
+    merged["재배치필요대수"] = (
+        merged["목표자전거수"] - merged["현재자전거수"]
+    ).clip(lower=0).round().astype(int)
 
     merged["실시간관리유형"] = "정상"
+
     merged.loc[
         (merged["현재점유율"] >= pickup_rate) & (merged["수거필요대수"] > 0),
         "실시간관리유형"
@@ -504,7 +572,6 @@ def prepare_realtime_decision_data(
         "실시간관리유형"
     ] = "재배치 후보"
 
-    # 과거 가중치
     for col in ["순유입량", "불균형_절댓값"]:
         if col not in merged.columns:
             merged[col] = 0
@@ -577,6 +644,7 @@ def recommend_simple_route(decision_df, depot_lat, depot_lon, vehicle_capacity, 
     while step_no <= max_stops:
         if load == 0:
             candidates = pickup_df[pickup_df["남은수거량"] > 0].copy()
+
             if len(candidates) == 0:
                 break
 
@@ -586,9 +654,11 @@ def recommend_simple_route(decision_df, depot_lat, depot_lon, vehicle_capacity, 
             )
 
             candidates["선택점수"] = candidates["수거우선점수"] / (candidates["거리_km"] + 0.2)
+
             selected = candidates.sort_values("선택점수", ascending=False).iloc[0]
 
             amount = int(min(selected["남은수거량"], vehicle_capacity - load))
+
             if amount <= 0:
                 break
 
@@ -609,6 +679,7 @@ def recommend_simple_route(decision_df, depot_lat, depot_lon, vehicle_capacity, 
             })
 
             pickup_df.loc[pickup_df["대여소_ID"] == selected["대여소_ID"], "남은수거량"] -= amount
+
             load += amount
             current_lat = selected["위도"]
             current_lon = selected["경도"]
@@ -616,6 +687,7 @@ def recommend_simple_route(decision_df, depot_lat, depot_lon, vehicle_capacity, 
 
         else:
             candidates = delivery_df[delivery_df["남은배치량"] > 0].copy()
+
             if len(candidates) == 0:
                 break
 
@@ -625,9 +697,11 @@ def recommend_simple_route(decision_df, depot_lat, depot_lon, vehicle_capacity, 
             )
 
             candidates["선택점수"] = candidates["재배치우선점수"] / (candidates["거리_km"] + 0.2)
+
             selected = candidates.sort_values("선택점수", ascending=False).iloc[0]
 
             amount = int(min(selected["남은배치량"], load))
+
             if amount <= 0:
                 break
 
@@ -648,6 +722,7 @@ def recommend_simple_route(decision_df, depot_lat, depot_lon, vehicle_capacity, 
             })
 
             delivery_df.loc[delivery_df["대여소_ID"] == selected["대여소_ID"], "남은배치량"] -= amount
+
             load -= amount
             current_lat = selected["위도"]
             current_lon = selected["경도"]
@@ -686,7 +761,8 @@ def make_realtime_status_map(decision_df):
         <b>대여소명:</b> {row.get('실시간_대여소명', '')}<br>
         <b>현재 자전거 수:</b> {int(row.get('현재자전거수', 0))}대<br>
         <b>거치대 수:</b> {int(row.get('거치대수', 0))}개<br>
-        <b>현재 점유율:</b> {row.get('현재점유율', 0):.1%}<br>
+        <b>API 거치율:</b> {row.get('거치율', 0):.1f}%<br>
+        <b>계산 점유율:</b> {row.get('현재점유율', 0):.1%}<br>
         <b>목표 자전거 수:</b> {int(row.get('목표자전거수', 0))}대<br>
         <b>수거 필요 대수:</b> {int(row.get('수거필요대수', 0))}대<br>
         <b>재배치 필요 대수:</b> {int(row.get('재배치필요대수', 0))}대<br>
@@ -696,6 +772,7 @@ def make_realtime_status_map(decision_df):
         """
 
         radius = 7
+
         if status == "수거 후보":
             radius = 7 + min(row["수거필요대수"], 20) * 0.5
         elif status == "재배치 후보":
@@ -708,7 +785,7 @@ def make_realtime_status_map(decision_df):
             fill=True,
             fill_color=color,
             fill_opacity=0.65,
-            popup=folium.Popup(popup_text, max_width=330)
+            popup=folium.Popup(popup_text, max_width=350)
         ).add_to(m)
 
         folium.Marker(
@@ -737,7 +814,7 @@ def make_realtime_status_map(decision_df):
 
 
 def make_route_map(route_df, depot_lat, depot_lon):
-    if len(route_df) == 0:
+    if route_df is None or len(route_df) == 0:
         return None
 
     center_lat = route_df["위도"].mean()
@@ -776,7 +853,7 @@ def make_route_map(route_df, depot_lat, depot_lon):
         folium.Marker(
             location=[row["위도"], row["경도"]],
             tooltip=f"{int(row['순서'])}. {row['작업']} {int(row['작업대수'])}대",
-            popup=folium.Popup(popup_text, max_width=330),
+            popup=folium.Popup(popup_text, max_width=350),
             icon=folium.Icon(color=color, icon=icon)
         ).add_to(m)
 
@@ -869,10 +946,13 @@ if view_mode == "전체 기간":
 
     with tab1:
         show_bar(data, "출발_건수", "전체 기간 출발 건수 상위 대여소", "total_departure")
+
     with tab2:
         show_bar(data, "종료_건수", "전체 기간 종료 건수 상위 대여소", "total_arrival")
+
     with tab3:
         show_bar(data, "불균형_절댓값", "전체 기간 불균형 절댓값 상위 대여소", "total_imbalance")
+
     with tab4:
         show_negative_bar(data, "전체 기간 순유출 상위 대여소", "total_outflow")
 
@@ -908,10 +988,13 @@ elif view_mode == "월별":
 
     with tab1:
         show_bar(data, "출발_건수", f"{selected_month} 출발 건수 상위 대여소", "month_departure")
+
     with tab2:
         show_bar(data, "종료_건수", f"{selected_month} 종료 건수 상위 대여소", "month_arrival")
+
     with tab3:
         show_bar(data, "불균형_절댓값", f"{selected_month} 불균형 절댓값 상위 대여소", "month_imbalance")
+
     with tab4:
         show_negative_bar(data, f"{selected_month} 순유출 상위 대여소", "month_outflow")
 
@@ -947,10 +1030,13 @@ elif view_mode == "날짜별":
 
     with tab1:
         show_bar(data, "출발_건수", f"{selected_date} 출발 건수 상위 대여소", "day_departure")
+
     with tab2:
         show_bar(data, "종료_건수", f"{selected_date} 종료 건수 상위 대여소", "day_arrival")
+
     with tab3:
         show_bar(data, "불균형_절댓값", f"{selected_date} 불균형 절댓값 상위 대여소", "day_imbalance")
+
     with tab4:
         show_negative_bar(data, f"{selected_date} 순유출 상위 대여소", "day_outflow")
 
@@ -981,6 +1067,7 @@ elif view_mode == "시계열 분석":
         markers=False,
         title="일별 출발 건수와 종료 건수"
     )
+
     st.plotly_chart(fig_daily, width="stretch")
 
     st.divider()
@@ -993,6 +1080,7 @@ elif view_mode == "시계열 분석":
         y="순유입량",
         title="일별 순유입량 = 종료 건수 - 출발 건수"
     )
+
     st.plotly_chart(fig_net, width="stretch")
 
     st.divider()
@@ -1005,6 +1093,7 @@ elif view_mode == "시계열 분석":
         y="불균형_절댓값",
         title="일별 불균형 절댓값 합계"
     )
+
     st.plotly_chart(fig_imbalance, width="stretch")
 
     st.divider()
@@ -1018,6 +1107,7 @@ elif view_mode == "시계열 분석":
         markers=True,
         title="월별 출발 건수와 종료 건수"
     )
+
     st.plotly_chart(fig_month, width="stretch")
 
     st.divider()
@@ -1036,6 +1126,7 @@ elif view_mode == "시계열 분석":
         y=["출발_건수", "종료_건수", "순유입량"],
         title=f"{selected_station} 일별 출발·종료·순유입량 추이"
     )
+
     st.plotly_chart(fig_station, width="stretch")
 
     st.divider()
@@ -1083,7 +1174,7 @@ elif view_mode == "실시간 경로 추천":
     st.subheader("실시간 따릉이 현황 기반 수거·재배치 경로 추천")
 
     st.markdown("""
-    이 화면은 서울시 따릉이 실시간 대여정보 API를 활용하여 현재 여의동 대여소의 자전거 수를 불러오고,
+    이 화면은 서울시 공공자전거 실시간 대여정보 API를 활용하여 현재 여의동 대여소의 자전거 수를 불러오고,
     운영 시나리오 값에 따라 수거 후보와 재배치 후보를 판단합니다.
 
     현재 단계의 경로 추천은 **직선거리 기반 휴리스틱 경로 추천**입니다.  
@@ -1128,14 +1219,14 @@ elif view_mode == "실시간 경로 추천":
 
     st.markdown("## 2. 실시간 API 설정")
 
-    api_key = None
-
-    if "SEOUL_API_KEY" in st.secrets:
+    try:
         api_key = st.secrets["SEOUL_API_KEY"]
         st.success("Streamlit Secrets에서 서울시 API 인증키를 불러왔습니다.")
-    else:
+    except Exception:
         api_key = st.text_input("서울시 OpenAPI 인증키 입력", type="password")
         st.info("배포용으로는 Streamlit Secrets에 SEOUL_API_KEY를 저장하는 것을 권장합니다.")
+
+    st.divider()
 
     st.markdown("## 3. 차량 출발지 설정")
 
@@ -1146,10 +1237,26 @@ elif view_mode == "실시간 경로 추천":
 
     with col1:
         depot_lat = st.number_input("차량 출발지 위도", value=center_lat_default, format="%.8f")
+
     with col2:
         depot_lon = st.number_input("차량 출발지 경도", value=center_lon_default, format="%.8f")
 
-    run_button = st.button("실시간 데이터 불러오기 및 경로 추천 실행")
+    col_run1, col_run2 = st.columns([1, 1])
+
+    with col_run1:
+        run_button = st.button("실시간 데이터 불러오기 및 경로 추천 실행")
+
+    with col_run2:
+        reset_button = st.button("저장된 실시간 결과 초기화")
+
+    if reset_button:
+        st.session_state["realtime_decision_df"] = None
+        st.session_state["realtime_route_df"] = None
+        st.session_state["realtime_vrp_input_df"] = None
+        st.session_state["realtime_loaded_time"] = None
+        st.session_state["realtime_depot_lat"] = None
+        st.session_state["realtime_depot_lon"] = None
+        st.success("저장된 실시간 분석 결과를 초기화했습니다.")
 
     if run_button:
         if not api_key:
@@ -1181,7 +1288,31 @@ elif view_mode == "실시간 경로 추천":
             st.error("여의동 대여소와 매칭된 실시간 데이터가 없습니다.")
             st.stop()
 
-        st.success(f"실시간 데이터 중 여의동 관련 대여소 {len(decision_df)}개를 분석했습니다.")
+        route, route_df = recommend_simple_route(
+            decision_df=decision_df,
+            depot_lat=depot_lat,
+            depot_lon=depot_lon,
+            vehicle_capacity=int(vehicle_capacity),
+            max_stops=int(max_stops)
+        )
+
+        vrp_input_df = make_vrp_input(decision_df)
+
+        st.session_state["realtime_decision_df"] = decision_df
+        st.session_state["realtime_route_df"] = route_df
+        st.session_state["realtime_vrp_input_df"] = vrp_input_df
+        st.session_state["realtime_loaded_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        st.session_state["realtime_depot_lat"] = depot_lat
+        st.session_state["realtime_depot_lon"] = depot_lon
+
+    if st.session_state["realtime_decision_df"] is not None:
+        decision_df = st.session_state["realtime_decision_df"]
+        route_df = st.session_state["realtime_route_df"]
+        vrp_input_df = st.session_state["realtime_vrp_input_df"]
+        depot_lat = st.session_state["realtime_depot_lat"]
+        depot_lon = st.session_state["realtime_depot_lon"]
+
+        st.success(f"실시간 분석 결과가 저장되어 있습니다. 갱신 시각: {st.session_state['realtime_loaded_time']}")
 
         st.divider()
 
@@ -1221,31 +1352,37 @@ elif view_mode == "실시간 경로 추천":
             pickup_candidates = decision_df[decision_df["실시간관리유형"] == "수거 후보"].copy()
             pickup_candidates = pickup_candidates.sort_values("수거우선점수", ascending=False)
 
-            st.dataframe(
-                pickup_candidates[
-                    [
-                        "대여소_ID", "실시간_대여소명", "거치대수", "현재자전거수", "현재점유율",
-                        "목표자전거수", "수거필요대수", "수거우선점수",
-                        "순유입량", "불균형_절댓값"
-                    ]
-                ],
-                width="stretch"
-            )
+            if len(pickup_candidates) == 0:
+                st.info("현재 설정 기준에서 수거 후보가 없습니다.")
+            else:
+                st.dataframe(
+                    pickup_candidates[
+                        [
+                            "대여소_ID", "실시간_대여소명", "거치대수", "현재자전거수", "거치율", "현재점유율",
+                            "목표자전거수", "수거필요대수", "수거우선점수",
+                            "순유입량", "불균형_절댓값"
+                        ]
+                    ],
+                    width="stretch"
+                )
 
         with tab2:
             delivery_candidates = decision_df[decision_df["실시간관리유형"] == "재배치 후보"].copy()
             delivery_candidates = delivery_candidates.sort_values("재배치우선점수", ascending=False)
 
-            st.dataframe(
-                delivery_candidates[
-                    [
-                        "대여소_ID", "실시간_대여소명", "거치대수", "현재자전거수", "현재점유율",
-                        "목표자전거수", "재배치필요대수", "재배치우선점수",
-                        "순유입량", "불균형_절댓값"
-                    ]
-                ],
-                width="stretch"
-            )
+            if len(delivery_candidates) == 0:
+                st.info("현재 설정 기준에서 재배치 후보가 없습니다.")
+            else:
+                st.dataframe(
+                    delivery_candidates[
+                        [
+                            "대여소_ID", "실시간_대여소명", "거치대수", "현재자전거수", "거치율", "현재점유율",
+                            "목표자전거수", "재배치필요대수", "재배치우선점수",
+                            "순유입량", "불균형_절댓값"
+                        ]
+                    ],
+                    width="stretch"
+                )
 
         with tab3:
             st.dataframe(decision_df, width="stretch")
@@ -1254,15 +1391,7 @@ elif view_mode == "실시간 경로 추천":
 
         st.markdown("## 7. 경로 추천")
 
-        route, route_df = recommend_simple_route(
-            decision_df=decision_df,
-            depot_lat=depot_lat,
-            depot_lon=depot_lon,
-            vehicle_capacity=vehicle_capacity,
-            max_stops=int(max_stops)
-        )
-
-        if len(route_df) == 0:
+        if route_df is None or len(route_df) == 0:
             st.warning("수거 후보와 재배치 후보가 모두 있어야 경로 추천이 가능합니다.")
         else:
             route_map = make_route_map(route_df, depot_lat, depot_lon)
@@ -1282,9 +1411,7 @@ elif view_mode == "실시간 경로 추천":
 
         st.markdown("## 8. VRP 입력 데이터")
 
-        vrp_input_df = make_vrp_input(decision_df)
-
-        if len(vrp_input_df) == 0:
+        if vrp_input_df is None or len(vrp_input_df) == 0:
             st.warning("VRP 입력 데이터로 변환할 후보가 없습니다.")
         else:
             st.dataframe(vrp_input_df, width="stretch")
@@ -1297,3 +1424,6 @@ elif view_mode == "실시간 경로 추천":
                 file_name="vrp_input_yeouido_realtime.csv",
                 mime="text/csv"
             )
+
+    else:
+        st.info("아직 실시간 분석 결과가 없습니다. 위 설정을 입력한 뒤 실행 버튼을 눌러주세요.")
