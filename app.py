@@ -33,7 +33,7 @@ st.markdown("""
 - 핵심 지표: `순유입량 = 종료_건수 - 출발_건수`
 - 관리 기준: `불균형_절댓값 = |순유입량|`
 - 실시간 판단 기준: 현재 자전거 수, 거치대 수, 현재 점유율
-- 경로 추천 방식: 직선거리 휴리스틱 / OSRM 도로망 거리행렬 / OR-Tools VRP
+- 경로 추천 방식: 직선거리 휴리스틱 / 직선거리 기반 OR-Tools VRP / OSRM 도로망 기반 OR-Tools VRP
 """)
 
 
@@ -108,7 +108,8 @@ session_keys = [
     "realtime_loaded_time",
     "realtime_depot_lat",
     "realtime_depot_lon",
-    "realtime_method_used"
+    "realtime_method_used",
+    "realtime_draw_road_route"
 ]
 
 for key in session_keys:
@@ -549,7 +550,11 @@ def prepare_realtime_decision_data(
     merged["위도"] = pd.to_numeric(merged["위도"], errors="coerce")
     merged["경도"] = pd.to_numeric(merged["경도"], errors="coerce")
 
-    merged = merged[(merged["거치대수"] > 0) & merged["위도"].notna() & merged["경도"].notna()].copy()
+    merged = merged[
+        (merged["거치대수"] > 0) &
+        merged["위도"].notna() &
+        merged["경도"].notna()
+    ].copy()
 
     if len(merged) == 0:
         return pd.DataFrame()
@@ -568,12 +573,14 @@ def prepare_realtime_decision_data(
     merged["실시간관리유형"] = "정상"
 
     merged.loc[
-        (merged["현재점유율"] >= pickup_rate) & (merged["수거필요대수"] > 0),
+        (merged["현재점유율"] >= pickup_rate) &
+        (merged["수거필요대수"] > 0),
         "실시간관리유형"
     ] = "수거 후보"
 
     merged.loc[
-        (merged["현재점유율"] <= delivery_rate) & (merged["재배치필요대수"] > 0),
+        (merged["현재점유율"] <= delivery_rate) &
+        (merged["재배치필요대수"] > 0),
         "실시간관리유형"
     ] = "재배치 후보"
 
@@ -651,7 +658,7 @@ def get_osrm_matrix(nodes):
         return [[0]], [[0]], None
 
     if len(nodes) > 25:
-        return None, None, "OSRM 공개 서버 안정성을 위해 후보 노드는 25개 이하로 제한하는 것이 좋습니다."
+        return None, None, "OSRM 공개 서버 안정성을 위해 후보 노드는 25개 이하로 제한하세요."
 
     coord_text = ";".join([f"{node['lon']},{node['lat']}" for node in nodes])
 
@@ -661,7 +668,7 @@ def get_osrm_matrix(nodes):
     )
 
     try:
-        response = requests.get(url, timeout=25)
+        response = requests.get(url, timeout=30)
         response.raise_for_status()
         data = response.json()
 
@@ -675,12 +682,12 @@ def get_osrm_matrix(nodes):
             return None, None, data
 
         duration_matrix = [
-            [int(x) if x is not None else 10**7 for x in row]
+            [int(x) if x is not None else 10**8 for x in row]
             for row in durations
         ]
 
         distance_matrix = [
-            [int(x) if x is not None else 10**7 for x in row]
+            [int(x) if x is not None else 10**8 for x in row]
             for row in distances
         ]
 
@@ -690,7 +697,53 @@ def get_osrm_matrix(nodes):
         return None, None, str(e)
 
 
-def build_vrp_nodes(decision_df, depot_lat, depot_lon, candidate_limit, vehicle_count, vehicle_capacity):
+@st.cache_data(ttl=300)
+def get_osrm_route_geometry(lat1, lon1, lat2, lon2):
+    url = (
+        f"https://router.project-osrm.org/route/v1/driving/"
+        f"{lon1},{lat1};{lon2},{lat2}"
+        f"?overview=full&geometries=geojson"
+    )
+
+    try:
+        response = requests.get(url, timeout=20)
+        response.raise_for_status()
+        data = response.json()
+
+        if data.get("code") != "Ok":
+            return None
+
+        routes = data.get("routes", [])
+
+        if len(routes) == 0:
+            return None
+
+        coords = routes[0]["geometry"]["coordinates"]
+        return [[lat, lon] for lon, lat in coords]
+
+    except Exception:
+        return None
+
+
+def split_amount_into_chunks(amount, chunk_size):
+    chunks = []
+    remaining = int(amount)
+
+    while remaining > 0:
+        chunk = min(remaining, int(chunk_size))
+        chunks.append(chunk)
+        remaining -= chunk
+
+    return chunks
+
+
+def build_vrp_nodes(
+    decision_df,
+    depot_lat,
+    depot_lon,
+    candidate_limit,
+    vehicle_capacity
+):
     pickup_df = decision_df[
         (decision_df["실시간관리유형"] == "수거 후보") &
         (decision_df["수거필요대수"] > 0)
@@ -704,16 +757,6 @@ def build_vrp_nodes(decision_df, depot_lat, depot_lon, candidate_limit, vehicle_
     pickup_df = pickup_df.sort_values("수거우선점수", ascending=False).head(candidate_limit)
     delivery_df = delivery_df.sort_values("재배치우선점수", ascending=False).head(candidate_limit)
 
-    max_total_capacity = vehicle_count * vehicle_capacity
-
-    pickup_total = int(pickup_df["수거필요대수"].sum())
-    delivery_total = int(delivery_df["재배치필요대수"].sum())
-
-    if pickup_total <= 0 or delivery_total <= 0:
-        return [], pd.DataFrame()
-
-    target_total = min(pickup_total, delivery_total, max_total_capacity)
-
     nodes = [{
         "node_index": 0,
         "node_type": "depot",
@@ -721,73 +764,66 @@ def build_vrp_nodes(decision_df, depot_lat, depot_lon, candidate_limit, vehicle_
         "대여소명": "차량 출발지",
         "demand": 0,
         "priority_score": 0,
-        "lat": depot_lat,
-        "lon": depot_lon
+        "lat": float(depot_lat),
+        "lon": float(depot_lon),
+        "원본_작업대수": 0
     }]
 
-    remaining_pickup = target_total
-
     for _, row in pickup_df.iterrows():
-        if remaining_pickup <= 0:
-            break
+        chunks = split_amount_into_chunks(row["수거필요대수"], vehicle_capacity)
 
-        amount = int(min(row["수거필요대수"], remaining_pickup))
-
-        if amount <= 0:
-            continue
-
-        nodes.append({
-            "node_index": len(nodes),
-            "node_type": "pickup",
-            "대여소_ID": row["대여소_ID"],
-            "대여소명": row["실시간_대여소명"],
-            "demand": amount,
-            "priority_score": float(row["수거우선점수"]),
-            "lat": float(row["위도"]),
-            "lon": float(row["경도"])
-        })
-
-        remaining_pickup -= amount
-
-    remaining_delivery = target_total
+        for idx, chunk in enumerate(chunks):
+            nodes.append({
+                "node_index": len(nodes),
+                "node_type": "pickup",
+                "대여소_ID": row["대여소_ID"],
+                "대여소명": f"{row['실시간_대여소명']} / 수거분할{idx + 1}",
+                "demand": int(chunk),
+                "priority_score": float(row["수거우선점수"]),
+                "lat": float(row["위도"]),
+                "lon": float(row["경도"]),
+                "원본_작업대수": int(row["수거필요대수"])
+            })
 
     for _, row in delivery_df.iterrows():
-        if remaining_delivery <= 0:
-            break
+        chunks = split_amount_into_chunks(row["재배치필요대수"], vehicle_capacity)
 
-        amount = int(min(row["재배치필요대수"], remaining_delivery))
-
-        if amount <= 0:
-            continue
-
-        nodes.append({
-            "node_index": len(nodes),
-            "node_type": "delivery",
-            "대여소_ID": row["대여소_ID"],
-            "대여소명": row["실시간_대여소명"],
-            "demand": -amount,
-            "priority_score": float(row["재배치우선점수"]),
-            "lat": float(row["위도"]),
-            "lon": float(row["경도"])
-        })
-
-        remaining_delivery -= amount
+        for idx, chunk in enumerate(chunks):
+            nodes.append({
+                "node_index": len(nodes),
+                "node_type": "delivery",
+                "대여소_ID": row["대여소_ID"],
+                "대여소명": f"{row['실시간_대여소명']} / 배치분할{idx + 1}",
+                "demand": -int(chunk),
+                "priority_score": float(row["재배치우선점수"]),
+                "lat": float(row["위도"]),
+                "lon": float(row["경도"]),
+                "원본_작업대수": int(row["재배치필요대수"])
+            })
 
     nodes_df = pd.DataFrame(nodes)
 
     return nodes, nodes_df
 
 
-def solve_ortools_vrp(nodes, cost_matrix, vehicle_count, vehicle_capacity):
+def solve_ortools_vrp(
+    nodes,
+    cost_matrix,
+    vehicle_count,
+    vehicle_capacity,
+    initial_load_per_vehicle,
+    max_stops_per_vehicle,
+    max_route_cost
+):
     if not ORTOOLS_AVAILABLE:
         return pd.DataFrame(), "OR-Tools가 설치되어 있지 않습니다. requirements.txt에 ortools를 추가하세요."
 
     if len(nodes) <= 1:
-        return pd.DataFrame(), "VRP를 풀 후보 노드가 부족합니다."
+        return pd.DataFrame(), "VRP 후보 노드가 부족합니다."
 
     manager = pywrapcp.RoutingIndexManager(
         len(nodes),
-        vehicle_count,
+        int(vehicle_count),
         0
     )
 
@@ -799,8 +835,18 @@ def solve_ortools_vrp(nodes, cost_matrix, vehicle_count, vehicle_capacity):
         return int(cost_matrix[from_node][to_node])
 
     transit_callback_index = routing.RegisterTransitCallback(distance_callback)
-
     routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+
+    routing.AddDimension(
+        transit_callback_index,
+        0,
+        int(max_route_cost),
+        True,
+        "Distance"
+    )
+
+    distance_dimension = routing.GetDimensionOrDie("Distance")
+    distance_dimension.SetGlobalSpanCostCoefficient(100)
 
     demands = [int(node["demand"]) for node in nodes]
 
@@ -813,19 +859,36 @@ def solve_ortools_vrp(nodes, cost_matrix, vehicle_count, vehicle_capacity):
     routing.AddDimensionWithVehicleCapacity(
         demand_callback_index,
         0,
-        [vehicle_capacity] * vehicle_count,
-        True,
+        [int(vehicle_capacity)] * int(vehicle_count),
+        False,
         "Capacity"
     )
 
     capacity_dimension = routing.GetDimensionOrDie("Capacity")
 
-    for node_idx, node in enumerate(nodes):
-        if node_idx == 0:
-            continue
+    for vehicle_id in range(int(vehicle_count)):
+        start_index = routing.Start(vehicle_id)
+        start_load = int(initial_load_per_vehicle)
+        capacity_dimension.CumulVar(start_index).SetRange(start_load, start_load)
 
+    def visit_callback(from_index):
+        from_node = manager.IndexToNode(from_index)
+        return 0 if from_node == 0 else 1
+
+    visit_callback_index = routing.RegisterUnaryTransitCallback(visit_callback)
+
+    routing.AddDimension(
+        visit_callback_index,
+        0,
+        int(max_stops_per_vehicle),
+        True,
+        "VisitCount"
+    )
+
+    for node_idx in range(1, len(nodes)):
         index = manager.NodeToIndex(node_idx)
-        routing.AddDisjunction([index], 1_000_000)
+        penalty = int(1_000_000 * max(float(nodes[node_idx]["priority_score"]), 0.1))
+        routing.AddDisjunction([index], penalty)
 
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
     search_parameters.first_solution_strategy = (
@@ -834,16 +897,16 @@ def solve_ortools_vrp(nodes, cost_matrix, vehicle_count, vehicle_capacity):
     search_parameters.local_search_metaheuristic = (
         routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
     )
-    search_parameters.time_limit.seconds = 10
+    search_parameters.time_limit.seconds = 15
 
     solution = routing.SolveWithParameters(search_parameters)
 
     if solution is None:
-        return pd.DataFrame(), "VRP 해를 찾지 못했습니다. 후보 수나 차량 용량을 조정해보세요."
+        return pd.DataFrame(), "VRP 해를 찾지 못했습니다. 후보 수, 차량 수, 차량 용량, 최대 방문 수를 조정해보세요."
 
     route_rows = []
 
-    for vehicle_id in range(vehicle_count):
+    for vehicle_id in range(int(vehicle_count)):
         index = routing.Start(vehicle_id)
         order = 1
         cumulative_cost = 0
@@ -854,7 +917,6 @@ def solve_ortools_vrp(nodes, cost_matrix, vehicle_count, vehicle_capacity):
 
             if node_id != 0:
                 node = nodes[node_id]
-                load_after = solution.Value(capacity_dimension.CumulVar(index))
 
                 if node["node_type"] == "pickup":
                     work = "수거"
@@ -866,6 +928,9 @@ def solve_ortools_vrp(nodes, cost_matrix, vehicle_count, vehicle_capacity):
                     work = "출발지"
                     amount = 0
 
+                load_before = solution.Value(capacity_dimension.CumulVar(index))
+                load_after = load_before + int(node["demand"])
+
                 route_rows.append({
                     "차량": vehicle_id + 1,
                     "순서": order,
@@ -873,6 +938,7 @@ def solve_ortools_vrp(nodes, cost_matrix, vehicle_count, vehicle_capacity):
                     "대여소_ID": node["대여소_ID"],
                     "대여소명": node["대여소명"],
                     "작업대수": amount,
+                    "방문전_차량적재량": load_before,
                     "방문후_차량적재량": load_after,
                     "위도": node["lat"],
                     "경도": node["lon"],
@@ -884,19 +950,27 @@ def solve_ortools_vrp(nodes, cost_matrix, vehicle_count, vehicle_capacity):
             if not routing.IsEnd(next_index):
                 from_node = manager.IndexToNode(index)
                 to_node = manager.IndexToNode(next_index)
-                cumulative_cost += cost_matrix[from_node][to_node]
+                cumulative_cost += int(cost_matrix[from_node][to_node])
 
             index = next_index
 
     route_df = pd.DataFrame(route_rows)
 
     if len(route_df) == 0:
-        return pd.DataFrame(), "방문 노드가 없습니다. 후보 수나 제약조건을 조정해보세요."
+        return pd.DataFrame(), "방문 노드가 없습니다. 조건을 완화해보세요."
 
     return route_df, None
 
 
-def recommend_simple_route(decision_df, depot_lat, depot_lon, vehicle_capacity, max_stops, use_osrm=False):
+def recommend_simple_route(
+    decision_df,
+    depot_lat,
+    depot_lon,
+    vehicle_count,
+    vehicle_capacity,
+    initial_load_per_vehicle,
+    max_stops_per_vehicle
+):
     pickup_df = decision_df[
         (decision_df["실시간관리유형"] == "수거 후보") &
         (decision_df["수거필요대수"] > 0)
@@ -907,109 +981,108 @@ def recommend_simple_route(decision_df, depot_lat, depot_lon, vehicle_capacity, 
         (decision_df["재배치필요대수"] > 0)
     ].copy()
 
-    if len(pickup_df) == 0 or len(delivery_df) == 0:
-        return pd.DataFrame(), None
+    if len(pickup_df) > 0:
+        pickup_df["남은수거량"] = pickup_df["수거필요대수"]
 
-    pickup_df["남은수거량"] = pickup_df["수거필요대수"]
-    delivery_df["남은배치량"] = delivery_df["재배치필요대수"]
+    if len(delivery_df) > 0:
+        delivery_df["남은배치량"] = delivery_df["재배치필요대수"]
 
-    route = []
-    current_lat = depot_lat
-    current_lon = depot_lon
-    load = 0
-    total_distance = 0
-    step_no = 1
+    route_rows = []
 
-    while step_no <= max_stops:
-        if load == 0:
-            candidates = pickup_df[pickup_df["남은수거량"] > 0].copy()
+    for vehicle_id in range(1, int(vehicle_count) + 1):
+        current_lat = float(depot_lat)
+        current_lon = float(depot_lon)
+        load = int(initial_load_per_vehicle)
+        step_no = 1
+        total_distance = 0
 
-            if len(candidates) == 0:
+        while step_no <= int(max_stops_per_vehicle):
+            if load > 0 and len(delivery_df) > 0 and len(delivery_df[delivery_df["남은배치량"] > 0]) > 0:
+                candidates = delivery_df[delivery_df["남은배치량"] > 0].copy()
+
+                candidates["거리_km"] = candidates.apply(
+                    lambda row: haversine_km(current_lat, current_lon, row["위도"], row["경도"]),
+                    axis=1
+                )
+
+                candidates["선택점수"] = candidates["재배치우선점수"] / (candidates["거리_km"] + 0.2)
+                selected = candidates.sort_values("선택점수", ascending=False).iloc[0]
+
+                amount = int(min(selected["남은배치량"], load))
+
+                if amount <= 0:
+                    break
+
+                distance = float(selected["거리_km"])
+                total_distance += distance
+
+                route_rows.append({
+                    "차량": vehicle_id,
+                    "순서": step_no,
+                    "작업": "재배치",
+                    "대여소_ID": selected["대여소_ID"],
+                    "대여소명": selected.get("실시간_대여소명", selected.get("대여소명", "")),
+                    "작업대수": amount,
+                    "방문전_차량적재량": load,
+                    "방문후_차량적재량": load - amount,
+                    "이동거리_km": round(distance, 3),
+                    "누적거리_km": round(total_distance, 3),
+                    "위도": selected["위도"],
+                    "경도": selected["경도"]
+                })
+
+                delivery_df.loc[delivery_df["대여소_ID"] == selected["대여소_ID"], "남은배치량"] -= amount
+
+                load -= amount
+                current_lat = selected["위도"]
+                current_lon = selected["경도"]
+                step_no += 1
+
+            elif load < int(vehicle_capacity) and len(pickup_df) > 0 and len(pickup_df[pickup_df["남은수거량"] > 0]) > 0:
+                candidates = pickup_df[pickup_df["남은수거량"] > 0].copy()
+
+                candidates["거리_km"] = candidates.apply(
+                    lambda row: haversine_km(current_lat, current_lon, row["위도"], row["경도"]),
+                    axis=1
+                )
+
+                candidates["선택점수"] = candidates["수거우선점수"] / (candidates["거리_km"] + 0.2)
+                selected = candidates.sort_values("선택점수", ascending=False).iloc[0]
+
+                amount = int(min(selected["남은수거량"], int(vehicle_capacity) - load))
+
+                if amount <= 0:
+                    break
+
+                distance = float(selected["거리_km"])
+                total_distance += distance
+
+                route_rows.append({
+                    "차량": vehicle_id,
+                    "순서": step_no,
+                    "작업": "수거",
+                    "대여소_ID": selected["대여소_ID"],
+                    "대여소명": selected.get("실시간_대여소명", selected.get("대여소명", "")),
+                    "작업대수": amount,
+                    "방문전_차량적재량": load,
+                    "방문후_차량적재량": load + amount,
+                    "이동거리_km": round(distance, 3),
+                    "누적거리_km": round(total_distance, 3),
+                    "위도": selected["위도"],
+                    "경도": selected["경도"]
+                })
+
+                pickup_df.loc[pickup_df["대여소_ID"] == selected["대여소_ID"], "남은수거량"] -= amount
+
+                load += amount
+                current_lat = selected["위도"]
+                current_lon = selected["경도"]
+                step_no += 1
+
+            else:
                 break
 
-            candidates["거리_km"] = candidates.apply(
-                lambda row: haversine_km(current_lat, current_lon, row["위도"], row["경도"]),
-                axis=1
-            )
-
-            candidates["선택점수"] = candidates["수거우선점수"] / (candidates["거리_km"] + 0.2)
-            selected = candidates.sort_values("선택점수", ascending=False).iloc[0]
-
-            amount = int(min(selected["남은수거량"], vehicle_capacity - load))
-
-            if amount <= 0:
-                break
-
-            distance = float(selected["거리_km"])
-            total_distance += distance
-
-            route.append({
-                "차량": 1,
-                "순서": step_no,
-                "작업": "수거",
-                "대여소_ID": selected["대여소_ID"],
-                "대여소명": selected.get("실시간_대여소명", selected.get("대여소명", "")),
-                "작업대수": amount,
-                "방문후_차량적재량": load + amount,
-                "이동거리_km": round(distance, 3),
-                "누적거리_km": round(total_distance, 3),
-                "위도": selected["위도"],
-                "경도": selected["경도"]
-            })
-
-            pickup_df.loc[pickup_df["대여소_ID"] == selected["대여소_ID"], "남은수거량"] -= amount
-
-            load += amount
-            current_lat = selected["위도"]
-            current_lon = selected["경도"]
-            step_no += 1
-
-        else:
-            candidates = delivery_df[delivery_df["남은배치량"] > 0].copy()
-
-            if len(candidates) == 0:
-                break
-
-            candidates["거리_km"] = candidates.apply(
-                lambda row: haversine_km(current_lat, current_lon, row["위도"], row["경도"]),
-                axis=1
-            )
-
-            candidates["선택점수"] = candidates["재배치우선점수"] / (candidates["거리_km"] + 0.2)
-            selected = candidates.sort_values("선택점수", ascending=False).iloc[0]
-
-            amount = int(min(selected["남은배치량"], load))
-
-            if amount <= 0:
-                break
-
-            distance = float(selected["거리_km"])
-            total_distance += distance
-
-            route.append({
-                "차량": 1,
-                "순서": step_no,
-                "작업": "재배치",
-                "대여소_ID": selected["대여소_ID"],
-                "대여소명": selected.get("실시간_대여소명", selected.get("대여소명", "")),
-                "작업대수": amount,
-                "방문후_차량적재량": load - amount,
-                "이동거리_km": round(distance, 3),
-                "누적거리_km": round(total_distance, 3),
-                "위도": selected["위도"],
-                "경도": selected["경도"]
-            })
-
-            delivery_df.loc[delivery_df["대여소_ID"] == selected["대여소_ID"], "남은배치량"] -= amount
-
-            load -= amount
-            current_lat = selected["위도"]
-            current_lon = selected["경도"]
-            step_no += 1
-
-    route_df = pd.DataFrame(route)
-
-    return route_df, None
+    return pd.DataFrame(route_rows), None
 
 
 def make_realtime_status_map(decision_df):
@@ -1093,7 +1166,7 @@ def make_realtime_status_map(decision_df):
     return m
 
 
-def make_route_map(route_df, depot_lat, depot_lon):
+def make_route_map(route_df, depot_lat, depot_lon, use_osrm_geometry=True):
     if route_df is None or len(route_df) == 0:
         return None
 
@@ -1109,46 +1182,81 @@ def make_route_map(route_df, depot_lat, depot_lon):
         icon=folium.Icon(color="green", icon="home")
     ).add_to(m)
 
-    vehicle_groups = route_df.groupby("차량") if "차량" in route_df.columns else [(1, route_df)]
+    route_colors = ["purple", "orange", "darkred", "cadetblue", "darkgreen", "black", "darkpurple"]
 
-    route_colors = ["purple", "orange", "darkred", "cadetblue", "darkgreen", "black"]
+    vehicle_groups = route_df.groupby("차량")
 
     for vehicle_id, group in vehicle_groups:
         group = group.sort_values("순서")
-        points = [[depot_lat, depot_lon]]
         color_line = route_colors[(int(vehicle_id) - 1) % len(route_colors)]
 
+        prev_lat = float(depot_lat)
+        prev_lon = float(depot_lon)
+
         for _, row in group.iterrows():
+            cur_lat = float(row["위도"])
+            cur_lon = float(row["경도"])
+
+            if use_osrm_geometry:
+                road_points = get_osrm_route_geometry(prev_lat, prev_lon, cur_lat, cur_lon)
+
+                if road_points is not None:
+                    folium.PolyLine(
+                        road_points,
+                        color=color_line,
+                        weight=5,
+                        opacity=0.75
+                    ).add_to(m)
+                else:
+                    folium.PolyLine(
+                        [[prev_lat, prev_lon], [cur_lat, cur_lon]],
+                        color=color_line,
+                        weight=4,
+                        opacity=0.5,
+                        dash_array="5, 5"
+                    ).add_to(m)
+            else:
+                folium.PolyLine(
+                    [[prev_lat, prev_lon], [cur_lat, cur_lon]],
+                    color=color_line,
+                    weight=4,
+                    opacity=0.65,
+                    dash_array="5, 5"
+                ).add_to(m)
+
             if row["작업"] == "수거":
-                color = "red"
+                marker_color = "red"
                 icon = "arrow-up"
             else:
-                color = "blue"
+                marker_color = "blue"
                 icon = "arrow-down"
 
-            points.append([row["위도"], row["경도"]])
-
             popup_text = f"""
-            <b>차량 {int(row.get('차량', 1))} - {int(row['순서'])}. {row['작업']}</b><br>
+            <b>차량 {int(row['차량'])} - {int(row['순서'])}. {row['작업']}</b><br>
             <b>대여소:</b> {row['대여소명']}<br>
             <b>작업 대수:</b> {int(row['작업대수'])}대<br>
-            <b>방문 후 차량 적재량:</b> {int(row.get('방문후_차량적재량', 0))}대<br>
+            <b>방문 전 적재량:</b> {int(row.get('방문전_차량적재량', 0))}대<br>
+            <b>방문 후 적재량:</b> {int(row.get('방문후_차량적재량', 0))}대<br>
             """
 
             if "이동거리_km" in row:
                 popup_text += f"<b>이동거리:</b> {row.get('이동거리_km', '')} km<br>"
+
             if "누적거리_km" in row:
                 popup_text += f"<b>누적거리:</b> {row.get('누적거리_km', '')} km<br>"
 
+            if "누적비용" in row:
+                popup_text += f"<b>누적비용:</b> {row.get('누적비용', '')}<br>"
+
             folium.Marker(
-                location=[row["위도"], row["경도"]],
-                tooltip=f"차량 {int(row.get('차량', 1))} - {int(row['순서'])}. {row['작업']} {int(row['작업대수'])}대",
+                location=[cur_lat, cur_lon],
+                tooltip=f"차량 {int(row['차량'])} - {int(row['순서'])}. {row['작업']} {int(row['작업대수'])}대",
                 popup=folium.Popup(popup_text, max_width=350),
-                icon=folium.Icon(color=color, icon=icon)
+                icon=folium.Icon(color=marker_color, icon=icon)
             ).add_to(m)
 
             folium.Marker(
-                location=[row["위도"], row["경도"]],
+                location=[cur_lat, cur_lon],
                 icon=folium.DivIcon(
                     html=f"""
                     <div style="
@@ -1163,18 +1271,14 @@ def make_route_map(route_df, depot_lat, depot_lon):
                         box-shadow: 1px 1px 2px rgba(0,0,0,0.25);
                         transform: translate(8px, -8px);
                     ">
-                        차량 {int(row.get('차량', 1))}-{int(row['순서'])}. {row['작업']} {int(row['작업대수'])}대
+                        차량 {int(row['차량'])}-{int(row['순서'])}. {row['작업']} {int(row['작업대수'])}대
                     </div>
                     """
                 )
             ).add_to(m)
 
-        folium.PolyLine(
-            points,
-            color=color_line,
-            weight=4,
-            opacity=0.75
-        ).add_to(m)
+            prev_lat = cur_lat
+            prev_lon = cur_lon
 
     return m
 
@@ -1466,6 +1570,14 @@ elif view_mode == "실시간 경로 추천":
     st.markdown("""
     이 화면은 서울시 공공자전거 실시간 대여정보 API를 활용하여 현재 여의동 대여소의 자전거 수를 불러오고,
     운영 시나리오 값에 따라 수거 후보와 재배치 후보를 판단합니다.
+
+    이번 버전은 다음 기능을 포함합니다.
+
+    - 차량 여러 대 운영 가능
+    - 차량별 초기 적재량 설정 가능
+    - 수거/재배치 필요 대수를 차량 용량 단위로 분할
+    - OR-Tools 기반 차량별 경로 분리
+    - OSRM Route API 기반 실제 도로 경로 표시
     """)
 
     with st.expander("지표 설명 보기", expanded=True):
@@ -1479,13 +1591,8 @@ elif view_mode == "실시간 경로 추천":
         따라서 출발 건수가 많은 대여소는 반복적으로 자전거가 부족해질 가능성이 있고,
         종료 건수가 많은 대여소는 반복적으로 자전거가 쌓일 가능성이 있습니다.
 
-        이 대시보드는 다음 두 정보를 결합합니다.
-
-        1. **실시간 상태**: 현재 자전거 수, 거치대 수, 현재 점유율  
-        2. **과거 패턴**: 2025년 같은 월의 출발·종료 불균형
-
-        즉, 단순히 지금 많은 곳/적은 곳만 보는 것이 아니라,
-        과거에도 반복적으로 과잉·부족이 발생했는지를 함께 반영하여 우선순위를 계산합니다.
+        이 대시보드는 실시간 상태와 2025년 같은 월의 과거 불균형 패턴을 함께 반영하여
+        수거·재배치 우선순위를 산정합니다.
         """)
 
     st.divider()
@@ -1496,25 +1603,36 @@ elif view_mode == "실시간 경로 추천":
         col1, col2, col3 = st.columns(3)
 
         with col1:
-            vehicle_count = st.number_input("투입 차량 수", min_value=1, max_value=10, value=1, step=1)
+            vehicle_count = st.number_input("투입 차량 수", min_value=1, max_value=10, value=2, step=1)
             vehicle_capacity = st.number_input("차량 1대당 적재 가능 대수", min_value=1, max_value=100, value=20, step=1)
-            max_stops = st.number_input("휴리스틱 추천 경로 최대 방문 지점 수", min_value=2, max_value=30, value=10, step=1)
+            initial_load_per_vehicle = st.number_input("차량별 초기 적재량", min_value=0, max_value=100, value=0, step=1)
 
         with col2:
+            max_stops_per_vehicle = st.number_input("차량별 최대 방문 지점 수", min_value=1, max_value=20, value=6, step=1)
+            candidate_limit = st.slider("수거/재배치 후보 수 제한", min_value=3, max_value=25, value=12, step=1)
+            max_route_cost = st.number_input("차량별 최대 경로 비용", min_value=1000, max_value=500000, value=100000, step=1000)
+
+        with col3:
             target_rate = st.slider("목표 점유율", min_value=0.1, max_value=0.9, value=0.5, step=0.05)
             pickup_rate = st.slider("수거 기준 점유율", min_value=0.5, max_value=1.0, value=0.8, step=0.05)
             delivery_rate = st.slider("재배치 기준 점유율", min_value=0.0, max_value=0.5, value=0.2, step=0.05)
 
-        with col3:
+        col4, col5 = st.columns(2)
+
+        with col4:
             realtime_weight = st.slider("실시간 상태 가중치", min_value=0.0, max_value=1.0, value=0.7, step=0.1)
             history_weight = round(1 - realtime_weight, 2)
             st.metric("과거 패턴 가중치", history_weight)
 
+        with col5:
             selected_month_number = st.selectbox(
                 "반영할 과거 월별 패턴",
                 list(range(1, 13)),
                 index=datetime.now().month - 1
             )
+
+    if initial_load_per_vehicle > vehicle_capacity:
+        st.warning("차량별 초기 적재량은 차량 적재 가능 대수보다 작거나 같아야 합니다.")
 
     if pickup_rate <= target_rate:
         st.warning("수거 기준 점유율은 목표 점유율보다 높게 설정하는 것이 좋습니다.")
@@ -1530,23 +1648,20 @@ elif view_mode == "실시간 경로 추천":
         "경로 추천 방식",
         [
             "직선거리 휴리스틱",
-            "OSRM 도로망 거리 + OR-Tools VRP",
-            "직선거리 거리행렬 + OR-Tools VRP"
+            "직선거리 거리행렬 + OR-Tools VRP",
+            "OSRM 도로망 거리 + OR-Tools VRP"
         ]
     )
 
-    candidate_limit = st.slider(
-        "VRP 후보 대여소 수 제한",
-        min_value=3,
-        max_value=25,
-        value=12,
-        step=1
+    draw_road_route = st.checkbox(
+        "지도에 실제 도로 경로로 표시",
+        value=True
     )
 
     if route_method == "OSRM 도로망 거리 + OR-Tools VRP":
         st.info(
             "OSRM은 별도 인증키 없이 테스트 가능하지만, 공개 서버는 대량 호출용이 아닙니다. "
-            "후보 수를 너무 크게 설정하지 않는 것이 좋습니다."
+            "후보 수를 25개 이하로 유지하는 것이 좋습니다."
         )
 
     if "OR-Tools" in route_method and not ORTOOLS_AVAILABLE:
@@ -1624,15 +1739,17 @@ elif view_mode == "실시간 경로 추천":
         vrp_input_df = make_vrp_input(decision_df)
 
         route_df = pd.DataFrame()
-        method_used = route_method
+        route_error = None
 
         if route_method == "직선거리 휴리스틱":
             route_df, route_error = recommend_simple_route(
                 decision_df=decision_df,
                 depot_lat=depot_lat,
                 depot_lon=depot_lon,
+                vehicle_count=int(vehicle_count),
                 vehicle_capacity=int(vehicle_capacity),
-                max_stops=int(max_stops)
+                initial_load_per_vehicle=int(initial_load_per_vehicle),
+                max_stops_per_vehicle=int(max_stops_per_vehicle)
             )
 
         else:
@@ -1641,23 +1758,20 @@ elif view_mode == "실시간 경로 추천":
                 depot_lat=depot_lat,
                 depot_lon=depot_lon,
                 candidate_limit=int(candidate_limit),
-                vehicle_count=int(vehicle_count),
                 vehicle_capacity=int(vehicle_capacity)
             )
 
             if len(nodes) <= 1:
-                st.warning("VRP를 구성할 수거/재배치 후보가 부족합니다.")
-                route_df = pd.DataFrame()
+                route_error = "VRP를 구성할 수거/재배치 후보가 부족합니다."
             else:
                 if route_method == "OSRM 도로망 거리 + OR-Tools VRP":
                     duration_matrix, distance_matrix, osrm_error = get_osrm_matrix(nodes)
 
                     if osrm_error is not None or duration_matrix is None:
-                        st.warning(f"OSRM 거리행렬 생성에 실패했습니다. 직선거리 행렬로 대체합니다. 오류: {osrm_error}")
+                        st.warning(f"OSRM 거리행렬 생성 실패. 직선거리 행렬로 대체합니다. 오류: {osrm_error}")
                         cost_matrix = get_haversine_matrix(nodes)
                     else:
                         cost_matrix = duration_matrix
-
                 else:
                     cost_matrix = get_haversine_matrix(nodes)
 
@@ -1665,11 +1779,14 @@ elif view_mode == "실시간 경로 추천":
                     nodes=nodes,
                     cost_matrix=cost_matrix,
                     vehicle_count=int(vehicle_count),
-                    vehicle_capacity=int(vehicle_capacity)
+                    vehicle_capacity=int(vehicle_capacity),
+                    initial_load_per_vehicle=int(initial_load_per_vehicle),
+                    max_stops_per_vehicle=int(max_stops_per_vehicle),
+                    max_route_cost=int(max_route_cost)
                 )
 
-                if route_error:
-                    st.warning(route_error)
+        if route_error:
+            st.warning(route_error)
 
         st.session_state["realtime_decision_df"] = decision_df
         st.session_state["realtime_route_df"] = route_df
@@ -1677,7 +1794,8 @@ elif view_mode == "실시간 경로 추천":
         st.session_state["realtime_loaded_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         st.session_state["realtime_depot_lat"] = depot_lat
         st.session_state["realtime_depot_lon"] = depot_lon
-        st.session_state["realtime_method_used"] = method_used
+        st.session_state["realtime_method_used"] = route_method
+        st.session_state["realtime_draw_road_route"] = draw_road_route
 
     if st.session_state["realtime_decision_df"] is not None:
         decision_df = st.session_state["realtime_decision_df"]
@@ -1686,6 +1804,7 @@ elif view_mode == "실시간 경로 추천":
         depot_lat = st.session_state["realtime_depot_lat"]
         depot_lon = st.session_state["realtime_depot_lon"]
         method_used = st.session_state["realtime_method_used"]
+        draw_road_route_saved = st.session_state.get("realtime_draw_road_route", True)
 
         st.success(
             f"실시간 분석 결과가 저장되어 있습니다. "
@@ -1733,16 +1852,7 @@ elif view_mode == "실시간 경로 추천":
             if len(pickup_candidates) == 0:
                 st.info("현재 설정 기준에서 수거 후보가 없습니다.")
             else:
-                st.dataframe(
-                    pickup_candidates[
-                        [
-                            "대여소_ID", "실시간_대여소명", "거치대수", "현재자전거수", "API_거치율", "현재점유율",
-                            "목표자전거수", "수거필요대수", "수거우선점수",
-                            "출발_건수", "종료_건수", "순유입량", "불균형_절댓값"
-                        ]
-                    ],
-                    width="stretch"
-                )
+                st.dataframe(pickup_candidates, width="stretch")
 
         with tab2:
             delivery_candidates = decision_df[decision_df["실시간관리유형"] == "재배치 후보"].copy()
@@ -1751,16 +1861,7 @@ elif view_mode == "실시간 경로 추천":
             if len(delivery_candidates) == 0:
                 st.info("현재 설정 기준에서 재배치 후보가 없습니다.")
             else:
-                st.dataframe(
-                    delivery_candidates[
-                        [
-                            "대여소_ID", "실시간_대여소명", "거치대수", "현재자전거수", "API_거치율", "현재점유율",
-                            "목표자전거수", "재배치필요대수", "재배치우선점수",
-                            "출발_건수", "종료_건수", "순유입량", "불균형_절댓값"
-                        ]
-                    ],
-                    width="stretch"
-                )
+                st.dataframe(delivery_candidates, width="stretch")
 
         with tab3:
             st.dataframe(decision_df, width="stretch")
@@ -1770,30 +1871,37 @@ elif view_mode == "실시간 경로 추천":
         st.markdown("## 8. 경로 추천 결과")
 
         if route_df is None or len(route_df) == 0:
-            st.warning("수거 후보와 재배치 후보가 모두 있어야 경로 추천이 가능합니다.")
+            st.warning(
+                "경로가 생성되지 않았습니다. 차량 수, 초기 적재량, 차량 용량, 재배치 기준 점유율, 후보 수 제한을 조정해보세요."
+            )
         else:
-            route_map = make_route_map(route_df, depot_lat, depot_lon)
+            route_map = make_route_map(
+                route_df,
+                depot_lat,
+                depot_lon,
+                use_osrm_geometry=draw_road_route_saved
+            )
 
             if route_map is not None:
                 st_folium(route_map, width=None, height=650, key="recommended_route_map")
 
-            st.markdown("### 추천 경로 표")
+            st.markdown("### 차량별 추천 경로 표")
             st.dataframe(route_df, width="stretch")
 
-            if method_used == "직선거리 휴리스틱":
-                st.info(
-                    "현재 경로는 직선거리 기반 휴리스틱 추천입니다. "
-                    "수거 후보와 재배치 후보를 우선점수와 거리 기준으로 순차 연결합니다."
-                )
-            elif method_used == "OSRM 도로망 거리 + OR-Tools VRP":
-                st.info(
-                    "현재 경로는 OSRM 도로망 이동시간 행렬과 OR-Tools VRP 모델을 결합하여 계산했습니다. "
-                    "다만 OSRM 공개 서버는 과제 데모 수준으로 사용하는 것이 적절합니다."
-                )
-            else:
-                st.info(
-                    "현재 경로는 위도·경도 직선거리 행렬과 OR-Tools VRP 모델을 결합하여 계산했습니다."
-                )
+            vehicle_summary = (
+                route_df.groupby("차량", as_index=False)
+                .agg({
+                    "작업대수": "sum",
+                    "대여소_ID": "count"
+                })
+                .rename(columns={
+                    "작업대수": "총 작업 대수",
+                    "대여소_ID": "방문 지점 수"
+                })
+            )
+
+            st.markdown("### 차량별 요약")
+            st.dataframe(vehicle_summary, width="stretch")
 
         st.divider()
 
