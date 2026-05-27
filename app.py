@@ -725,18 +725,6 @@ def get_osrm_route_geometry(lat1, lon1, lat2, lon2):
         return None
 
 
-def split_amount_into_chunks(amount, chunk_size):
-    chunks = []
-    remaining = int(amount)
-
-    while remaining > 0:
-        chunk = min(remaining, int(chunk_size))
-        chunks.append(chunk)
-        remaining -= chunk
-
-    return chunks
-
-
 def build_vrp_nodes(
     decision_df,
     depot_lat,
@@ -766,40 +754,49 @@ def build_vrp_nodes(
         "priority_score": 0,
         "lat": float(depot_lat),
         "lon": float(depot_lon),
-        "원본_작업대수": 0
+        "원본_작업대수": 0,
+        "미처리_가능성": 0
     }]
 
     for _, row in pickup_df.iterrows():
-        chunks = split_amount_into_chunks(row["수거필요대수"], vehicle_capacity)
+        original_need = int(row["수거필요대수"])
+        work_amount = int(min(original_need, vehicle_capacity))
 
-        for idx, chunk in enumerate(chunks):
-            nodes.append({
-                "node_index": len(nodes),
-                "node_type": "pickup",
-                "대여소_ID": row["대여소_ID"],
-                "대여소명": f"{row['실시간_대여소명']} / 수거분할{idx + 1}",
-                "demand": int(chunk),
-                "priority_score": float(row["수거우선점수"]),
-                "lat": float(row["위도"]),
-                "lon": float(row["경도"]),
-                "원본_작업대수": int(row["수거필요대수"])
-            })
+        if work_amount <= 0:
+            continue
+
+        nodes.append({
+            "node_index": len(nodes),
+            "node_type": "pickup",
+            "대여소_ID": row["대여소_ID"],
+            "대여소명": row["실시간_대여소명"],
+            "demand": work_amount,
+            "priority_score": float(row["수거우선점수"]),
+            "lat": float(row["위도"]),
+            "lon": float(row["경도"]),
+            "원본_작업대수": original_need,
+            "미처리_가능성": max(original_need - work_amount, 0)
+        })
 
     for _, row in delivery_df.iterrows():
-        chunks = split_amount_into_chunks(row["재배치필요대수"], vehicle_capacity)
+        original_need = int(row["재배치필요대수"])
+        work_amount = int(min(original_need, vehicle_capacity))
 
-        for idx, chunk in enumerate(chunks):
-            nodes.append({
-                "node_index": len(nodes),
-                "node_type": "delivery",
-                "대여소_ID": row["대여소_ID"],
-                "대여소명": f"{row['실시간_대여소명']} / 배치분할{idx + 1}",
-                "demand": -int(chunk),
-                "priority_score": float(row["재배치우선점수"]),
-                "lat": float(row["위도"]),
-                "lon": float(row["경도"]),
-                "원본_작업대수": int(row["재배치필요대수"])
-            })
+        if work_amount <= 0:
+            continue
+
+        nodes.append({
+            "node_index": len(nodes),
+            "node_type": "delivery",
+            "대여소_ID": row["대여소_ID"],
+            "대여소명": row["실시간_대여소명"],
+            "demand": -work_amount,
+            "priority_score": float(row["재배치우선점수"]),
+            "lat": float(row["위도"]),
+            "lon": float(row["경도"]),
+            "원본_작업대수": original_need,
+            "미처리_가능성": max(original_need - work_amount, 0)
+        })
 
     nodes_df = pd.DataFrame(nodes)
 
@@ -846,7 +843,7 @@ def solve_ortools_vrp(
     )
 
     distance_dimension = routing.GetDimensionOrDie("Distance")
-    distance_dimension.SetGlobalSpanCostCoefficient(100)
+    distance_dimension.SetGlobalSpanCostCoefficient(500)
 
     demands = [int(node["demand"]) for node in nodes]
 
@@ -885,9 +882,21 @@ def solve_ortools_vrp(
         "VisitCount"
     )
 
+    visit_dimension = routing.GetDimensionOrDie("VisitCount")
+
+    if len(nodes) - 1 >= int(vehicle_count):
+        for vehicle_id in range(int(vehicle_count)):
+            end_index = routing.End(vehicle_id)
+            visit_dimension.CumulVar(end_index).SetMin(1)
+
     for node_idx in range(1, len(nodes)):
         index = manager.NodeToIndex(node_idx)
-        penalty = int(1_000_000 * max(float(nodes[node_idx]["priority_score"]), 0.1))
+
+        priority = float(nodes[node_idx].get("priority_score", 0.1))
+        work_amount = abs(int(nodes[node_idx].get("demand", 1)))
+
+        penalty = int(1_000_000 * max(priority, 0.1) + work_amount * 10_000)
+
         routing.AddDisjunction([index], penalty)
 
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
@@ -902,7 +911,7 @@ def solve_ortools_vrp(
     solution = routing.SolveWithParameters(search_parameters)
 
     if solution is None:
-        return pd.DataFrame(), "VRP 해를 찾지 못했습니다. 후보 수, 차량 수, 차량 용량, 최대 방문 수를 조정해보세요."
+        return pd.DataFrame(), "VRP 해를 찾지 못했습니다. 차량 수, 차량 용량, 초기 적재량, 최대 방문 수를 조정해보세요."
 
     route_rows = []
 
@@ -938,6 +947,8 @@ def solve_ortools_vrp(
                     "대여소_ID": node["대여소_ID"],
                     "대여소명": node["대여소명"],
                     "작업대수": amount,
+                    "원본_필요대수": int(node.get("원본_작업대수", amount)),
+                    "미처리_가능성": int(node.get("미처리_가능성", 0)),
                     "방문전_차량적재량": load_before,
                     "방문후_차량적재량": load_after,
                     "위도": node["lat"],
@@ -1182,7 +1193,15 @@ def make_route_map(route_df, depot_lat, depot_lon, use_osrm_geometry=True):
         icon=folium.Icon(color="green", icon="home")
     ).add_to(m)
 
-    route_colors = ["purple", "orange", "darkred", "cadetblue", "darkgreen", "black", "darkpurple"]
+    route_colors = [
+        "purple",
+        "orange",
+        "darkred",
+        "cadetblue",
+        "darkgreen",
+        "black",
+        "darkpurple"
+    ]
 
     vehicle_groups = route_df.groupby("차량")
 
@@ -1212,7 +1231,7 @@ def make_route_map(route_df, depot_lat, depot_lon, use_osrm_geometry=True):
                         [[prev_lat, prev_lon], [cur_lat, cur_lon]],
                         color=color_line,
                         weight=4,
-                        opacity=0.5,
+                        opacity=0.45,
                         dash_array="5, 5"
                     ).add_to(m)
             else:
@@ -1225,16 +1244,20 @@ def make_route_map(route_df, depot_lat, depot_lon, use_osrm_geometry=True):
                 ).add_to(m)
 
             if row["작업"] == "수거":
-                marker_color = "red"
-                icon = "arrow-up"
+                marker_color = "#dc2626"
+                icon_text = "▲"
+                work_label = "수거"
             else:
-                marker_color = "blue"
-                icon = "arrow-down"
+                marker_color = "#2563eb"
+                icon_text = "▼"
+                work_label = "재배치"
 
             popup_text = f"""
             <b>차량 {int(row['차량'])} - {int(row['순서'])}. {row['작업']}</b><br>
             <b>대여소:</b> {row['대여소명']}<br>
             <b>작업 대수:</b> {int(row['작업대수'])}대<br>
+            <b>원본 필요 대수:</b> {int(row.get('원본_필요대수', row['작업대수']))}대<br>
+            <b>미처리 가능성:</b> {int(row.get('미처리_가능성', 0))}대<br>
             <b>방문 전 적재량:</b> {int(row.get('방문전_차량적재량', 0))}대<br>
             <b>방문 후 적재량:</b> {int(row.get('방문후_차량적재량', 0))}대<br>
             """
@@ -1250,9 +1273,28 @@ def make_route_map(route_df, depot_lat, depot_lon, use_osrm_geometry=True):
 
             folium.Marker(
                 location=[cur_lat, cur_lon],
-                tooltip=f"차량 {int(row['차량'])} - {int(row['순서'])}. {row['작업']} {int(row['작업대수'])}대",
+                tooltip=f"차량 {int(row['차량'])}-{int(row['순서'])}. {work_label} {int(row['작업대수'])}대",
                 popup=folium.Popup(popup_text, max_width=350),
-                icon=folium.Icon(color=marker_color, icon=icon)
+                icon=folium.DivIcon(
+                    html=f"""
+                    <div style="
+                        width: 30px;
+                        height: 30px;
+                        border-radius: 50%;
+                        background-color: {marker_color};
+                        color: white;
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                        font-size: 15px;
+                        font-weight: bold;
+                        border: 2px solid white;
+                        box-shadow: 1px 1px 4px rgba(0,0,0,0.45);
+                    ">
+                        {icon_text}
+                    </div>
+                    """
+                )
             ).add_to(m)
 
             folium.Marker(
@@ -1261,17 +1303,17 @@ def make_route_map(route_df, depot_lat, depot_lon, use_osrm_geometry=True):
                     html=f"""
                     <div style="
                         font-size: 11px;
-                        font-weight: bold;
+                        font-weight: 800;
                         color: #111111;
-                        background-color: rgba(255,255,255,0.92);
-                        border: 1px solid #333333;
-                        border-radius: 5px;
-                        padding: 1px 5px;
+                        background-color: rgba(255,255,255,0.96);
+                        border: 1px solid #111111;
+                        border-radius: 6px;
+                        padding: 2px 6px;
                         white-space: nowrap;
-                        box-shadow: 1px 1px 2px rgba(0,0,0,0.25);
-                        transform: translate(8px, -8px);
+                        box-shadow: 1px 1px 3px rgba(0,0,0,0.35);
+                        transform: translate(24px, -18px);
                     ">
-                        차량 {int(row['차량'])}-{int(row['순서'])}. {row['작업']} {int(row['작업대수'])}대
+                        차량 {int(row['차량'])}-{int(row['순서'])} · {work_label} {int(row['작업대수'])}대
                     </div>
                     """
                 )
@@ -1279,6 +1321,133 @@ def make_route_map(route_df, depot_lat, depot_lon, use_osrm_geometry=True):
 
             prev_lat = cur_lat
             prev_lon = cur_lon
+
+    return m
+
+
+def make_single_vehicle_route_map(route_df, depot_lat, depot_lon, vehicle_id, use_osrm_geometry=True):
+    vehicle_df = route_df[route_df["차량"] == vehicle_id].copy()
+
+    if len(vehicle_df) == 0:
+        return None
+
+    vehicle_df = vehicle_df.sort_values("순서")
+
+    center_lat = vehicle_df["위도"].mean()
+    center_lon = vehicle_df["경도"].mean()
+
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=15)
+
+    folium.Marker(
+        location=[depot_lat, depot_lon],
+        tooltip=f"차량 {int(vehicle_id)} 출발지",
+        popup=f"차량 {int(vehicle_id)} 출발지",
+        icon=folium.Icon(color="green", icon="home")
+    ).add_to(m)
+
+    prev_lat = float(depot_lat)
+    prev_lon = float(depot_lon)
+
+    for _, row in vehicle_df.iterrows():
+        cur_lat = float(row["위도"])
+        cur_lon = float(row["경도"])
+
+        if use_osrm_geometry:
+            road_points = get_osrm_route_geometry(prev_lat, prev_lon, cur_lat, cur_lon)
+
+            if road_points is not None:
+                folium.PolyLine(
+                    road_points,
+                    color="purple",
+                    weight=5,
+                    opacity=0.8
+                ).add_to(m)
+            else:
+                folium.PolyLine(
+                    [[prev_lat, prev_lon], [cur_lat, cur_lon]],
+                    color="purple",
+                    weight=4,
+                    opacity=0.45,
+                    dash_array="5, 5"
+                ).add_to(m)
+        else:
+            folium.PolyLine(
+                [[prev_lat, prev_lon], [cur_lat, cur_lon]],
+                color="purple",
+                weight=4,
+                opacity=0.65,
+                dash_array="5, 5"
+            ).add_to(m)
+
+        if row["작업"] == "수거":
+            marker_color = "#dc2626"
+            icon_text = "▲"
+            work_label = "수거"
+        else:
+            marker_color = "#2563eb"
+            icon_text = "▼"
+            work_label = "재배치"
+
+        popup_text = f"""
+        <b>차량 {int(row['차량'])} - {int(row['순서'])}. {row['작업']}</b><br>
+        <b>대여소:</b> {row['대여소명']}<br>
+        <b>작업 대수:</b> {int(row['작업대수'])}대<br>
+        <b>원본 필요 대수:</b> {int(row.get('원본_필요대수', row['작업대수']))}대<br>
+        <b>미처리 가능성:</b> {int(row.get('미처리_가능성', 0))}대<br>
+        <b>방문 전 적재량:</b> {int(row.get('방문전_차량적재량', 0))}대<br>
+        <b>방문 후 적재량:</b> {int(row.get('방문후_차량적재량', 0))}대<br>
+        """
+
+        folium.Marker(
+            location=[cur_lat, cur_lon],
+            tooltip=f"차량 {int(row['차량'])}-{int(row['순서'])}. {work_label} {int(row['작업대수'])}대",
+            popup=folium.Popup(popup_text, max_width=350),
+            icon=folium.DivIcon(
+                html=f"""
+                <div style="
+                    width: 32px;
+                    height: 32px;
+                    border-radius: 50%;
+                    background-color: {marker_color};
+                    color: white;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    font-size: 15px;
+                    font-weight: bold;
+                    border: 2px solid white;
+                    box-shadow: 1px 1px 4px rgba(0,0,0,0.45);
+                ">
+                    {icon_text}
+                </div>
+                """
+            )
+        ).add_to(m)
+
+        folium.Marker(
+            location=[cur_lat, cur_lon],
+            icon=folium.DivIcon(
+                html=f"""
+                <div style="
+                    font-size: 12px;
+                    font-weight: 800;
+                    color: #111111;
+                    background-color: rgba(255,255,255,0.96);
+                    border: 1px solid #111111;
+                    border-radius: 6px;
+                    padding: 2px 6px;
+                    white-space: nowrap;
+                    box-shadow: 1px 1px 3px rgba(0,0,0,0.35);
+                    transform: translate(26px, -18px);
+                ">
+                    {int(row['순서'])}. {work_label} {int(row['작업대수'])}대
+                </div>
+                """
+            )
+        ).add_to(m)
+
+        prev_lat = cur_lat
+        prev_lon = cur_lon
 
     return m
 
@@ -1575,9 +1744,11 @@ elif view_mode == "실시간 경로 추천":
 
     - 차량 여러 대 운영 가능
     - 차량별 초기 적재량 설정 가능
-    - 수거/재배치 필요 대수를 차량 용량 단위로 분할
+    - 같은 대여소의 중복 방문을 줄이기 위해 대여소별 작업은 1회 방문 기준으로 제한
+    - 차량 용량을 초과하는 잔여 수요는 미처리 가능성으로 표시
     - OR-Tools 기반 차량별 경로 분리
     - OSRM Route API 기반 실제 도로 경로 표시
+    - 전체 경로 지도와 차량별 개별 경로 지도 제공
     """)
 
     with st.expander("지표 설명 보기", expanded=True):
@@ -1875,6 +2046,8 @@ elif view_mode == "실시간 경로 추천":
                 "경로가 생성되지 않았습니다. 차량 수, 초기 적재량, 차량 용량, 재배치 기준 점유율, 후보 수 제한을 조정해보세요."
             )
         else:
+            st.markdown("### 전체 차량 경로 지도")
+
             route_map = make_route_map(
                 route_df,
                 depot_lat,
@@ -1883,9 +2056,45 @@ elif view_mode == "실시간 경로 추천":
             )
 
             if route_map is not None:
-                st_folium(route_map, width=None, height=650, key="recommended_route_map")
+                st_folium(route_map, width=None, height=650, key="recommended_route_map_all")
 
-            st.markdown("### 차량별 추천 경로 표")
+            st.divider()
+
+            st.markdown("### 차량별 경로 지도")
+
+            vehicle_ids = sorted(route_df["차량"].unique())
+
+            vehicle_tabs = st.tabs([f"차량 {int(v)}" for v in vehicle_ids])
+
+            for tab, vehicle_id in zip(vehicle_tabs, vehicle_ids):
+                with tab:
+                    vehicle_df = route_df[route_df["차량"] == vehicle_id].copy()
+                    vehicle_df = vehicle_df.sort_values("순서")
+
+                    st.markdown(f"#### 차량 {int(vehicle_id)} 경로")
+
+                    single_map = make_single_vehicle_route_map(
+                        route_df=route_df,
+                        depot_lat=depot_lat,
+                        depot_lon=depot_lon,
+                        vehicle_id=vehicle_id,
+                        use_osrm_geometry=draw_road_route_saved
+                    )
+
+                    if single_map is not None:
+                        st_folium(
+                            single_map,
+                            width=None,
+                            height=600,
+                            key=f"vehicle_{int(vehicle_id)}_route_map"
+                        )
+
+                    st.markdown("##### 차량별 방문 순서")
+                    st.dataframe(vehicle_df, width="stretch")
+
+            st.divider()
+
+            st.markdown("### 전체 차량 경로 표")
             st.dataframe(route_df, width="stretch")
 
             vehicle_summary = (
