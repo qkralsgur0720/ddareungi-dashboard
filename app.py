@@ -809,6 +809,51 @@ def add_route_line_with_arrows(
         except Exception:
             pass
 
+
+def add_osrm_segment_routes_with_arrows(
+    m,
+    ordered_points,
+    color="purple",
+    weight=5,
+    opacity=0.8,
+    fallback_opacity=0.55
+):
+    """
+    실제 도로 경로를 보이게 하기 위해 인접 지점마다 OSRM Route API를 호출한다.
+    OSRM이 실패한 구간만 직선 점선으로 대체한다.
+
+    ordered_points 형식: [[lat, lon], [lat, lon], ...]
+    """
+    if ordered_points is None or len(ordered_points) < 2:
+        return
+
+    for i in range(len(ordered_points) - 1):
+        prev_lat, prev_lon = ordered_points[i]
+        cur_lat, cur_lon = ordered_points[i + 1]
+
+        road_points = get_osrm_route_geometry(prev_lat, prev_lon, cur_lat, cur_lon)
+
+        if road_points is not None and len(road_points) >= 2:
+            add_route_line_with_arrows(
+                m,
+                road_points,
+                color=color,
+                weight=weight,
+                opacity=opacity,
+                use_arrows=True,
+                dashed=False
+            )
+        else:
+            add_route_line_with_arrows(
+                m,
+                [[prev_lat, prev_lon], [cur_lat, cur_lon]],
+                color=color,
+                weight=max(weight - 1, 3),
+                opacity=fallback_opacity,
+                use_arrows=True,
+                dashed=True
+            )
+
 def build_vrp_nodes(
     decision_df,
     depot_lat,
@@ -1294,41 +1339,22 @@ def make_route_map(route_df, depot_lat, depot_lon, use_osrm_geometry=True):
         group = group.sort_values("순서")
         color_line = route_colors[(int(vehicle_id) - 1) % len(route_colors)]
 
-        # =========================
-        # 차량별 전체 경로 좌표 생성
-        # =========================
         ordered_points = [[float(depot_lat), float(depot_lon)]]
 
         for _, row in group.iterrows():
             ordered_points.append([float(row["위도"]), float(row["경도"])])
 
-        # =========================
-        # OSRM 호출은 차량 1대당 1번만 수행
-        # 실패하면 직선 화살표 경로로 자동 대체
-        # =========================
+        # 실제 도로 경로 표시가 켜져 있으면 인접 구간별 OSRM 경로를 그림.
+        # 이렇게 해야 직선이 아니라 도로를 따라가는 흐름이 표시됨.
         if use_osrm_geometry:
-            road_points = get_osrm_route_geometry_many(ordered_points)
-
-            if road_points is not None:
-                add_route_line_with_arrows(
-                    m,
-                    road_points,
-                    color=color_line,
-                    weight=5,
-                    opacity=0.75,
-                    use_arrows=True,
-                    dashed=False
-                )
-            else:
-                add_route_line_with_arrows(
-                    m,
-                    ordered_points,
-                    color=color_line,
-                    weight=4,
-                    opacity=0.55,
-                    use_arrows=True,
-                    dashed=True
-                )
+            add_osrm_segment_routes_with_arrows(
+                m,
+                ordered_points,
+                color=color_line,
+                weight=5,
+                opacity=0.75,
+                fallback_opacity=0.45
+            )
         else:
             add_route_line_with_arrows(
                 m,
@@ -1340,9 +1366,6 @@ def make_route_map(route_df, depot_lat, depot_lon, use_osrm_geometry=True):
                 dashed=True
             )
 
-        # =========================
-        # 마커 표시
-        # =========================
         for _, row in group.iterrows():
             cur_lat = float(row["위도"])
             cur_lon = float(row["경도"])
@@ -1425,7 +1448,6 @@ def make_route_map(route_df, depot_lat, depot_lon, use_osrm_geometry=True):
 
     return m
 
-
 def make_single_vehicle_route_map(route_df, depot_lat, depot_lon, vehicle_id, use_osrm_geometry=True):
     vehicle_df = route_df[route_df["차량"] == vehicle_id].copy()
 
@@ -1446,41 +1468,22 @@ def make_single_vehicle_route_map(route_df, depot_lat, depot_lon, vehicle_id, us
         icon=folium.Icon(color="green", icon="home")
     ).add_to(m)
 
-    # =========================
-    # 차량별 전체 경로 좌표 생성
-    # =========================
     ordered_points = [[float(depot_lat), float(depot_lon)]]
 
     for _, row in vehicle_df.iterrows():
         ordered_points.append([float(row["위도"]), float(row["경도"])])
 
-    # =========================
-    # OSRM 호출은 차량 1대당 1번만 수행
-    # 실패하면 직선 화살표 경로로 자동 대체
-    # =========================
+    # 실제 도로 경로 표시가 켜져 있으면 인접 구간별 OSRM 경로를 그림.
+    # 이렇게 해야 직선이 아니라 도로를 따라가는 흐름이 표시됨.
     if use_osrm_geometry:
-        road_points = get_osrm_route_geometry_many(ordered_points)
-
-        if road_points is not None:
-            add_route_line_with_arrows(
-                m,
-                road_points,
-                color="purple",
-                weight=5,
-                opacity=0.8,
-                use_arrows=True,
-                dashed=False
-            )
-        else:
-            add_route_line_with_arrows(
-                m,
-                ordered_points,
-                color="purple",
-                weight=4,
-                opacity=0.55,
-                use_arrows=True,
-                dashed=True
-            )
+        add_osrm_segment_routes_with_arrows(
+            m,
+            ordered_points,
+            color="purple",
+            weight=5,
+            opacity=0.8,
+            fallback_opacity=0.45
+        )
     else:
         add_route_line_with_arrows(
             m,
@@ -1492,9 +1495,6 @@ def make_single_vehicle_route_map(route_df, depot_lat, depot_lon, vehicle_id, us
             dashed=True
         )
 
-    # =========================
-    # 마커 표시
-    # =========================
     for _, row in vehicle_df.iterrows():
         cur_lat = float(row["위도"])
         cur_lon = float(row["경도"])
@@ -1950,8 +1950,8 @@ elif view_mode == "실시간 경로 추천":
     )
 
     draw_road_route = st.checkbox(
-        "가능하면 OSRM 도로 경로로 표시하고, 실패 시 직선 화살표 경로로 대체",
-        value=False
+        "실제 도로 경로를 따라 표시하고, 실패한 구간만 직선 화살표로 대체",
+        value=True
     )
 
     if route_method == "OSRM 도로망 거리 + OR-Tools VRP":
