@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import folium
+from folium.plugins import PolyLineTextPath
 import requests
 import math
 from datetime import datetime
@@ -725,6 +726,89 @@ def get_osrm_route_geometry(lat1, lon1, lat2, lon2):
         return None
 
 
+
+@st.cache_data(ttl=300)
+def get_osrm_route_geometry_many(points):
+    """
+    차량 1대의 전체 방문 경로를 OSRM에 한 번만 요청하는 함수.
+    points 형식: [[lat, lon], [lat, lon], ...]
+    """
+    if points is None or len(points) < 2:
+        return None
+
+    # OSRM 공개 서버 보호용
+    # 한 차량 경로의 경유지가 너무 많으면 직선 경로로 대체
+    if len(points) > 12:
+        return None
+
+    coord_text = ";".join([f"{lon},{lat}" for lat, lon in points])
+
+    url = (
+        f"https://router.project-osrm.org/route/v1/driving/{coord_text}"
+        f"?overview=full&geometries=geojson&continue_straight=false"
+    )
+
+    try:
+        response = requests.get(url, timeout=20)
+        response.raise_for_status()
+        data = response.json()
+
+        if data.get("code") != "Ok":
+            return None
+
+        routes = data.get("routes", [])
+
+        if len(routes) == 0:
+            return None
+
+        coords = routes[0]["geometry"]["coordinates"]
+
+        # OSRM은 [lon, lat] 순서라 folium용 [lat, lon]으로 변환
+        return [[lat, lon] for lon, lat in coords]
+
+    except Exception:
+        return None
+
+
+def add_route_line_with_arrows(
+    m,
+    points,
+    color="purple",
+    weight=5,
+    opacity=0.8,
+    use_arrows=True,
+    dashed=False
+):
+    """
+    지도에 경로선을 그리고, 진행 방향을 알 수 있도록 화살표를 추가하는 함수.
+    """
+    if points is None or len(points) < 2:
+        return
+
+    polyline = folium.PolyLine(
+        points,
+        color=color,
+        weight=weight,
+        opacity=opacity,
+        dash_array="5, 5" if dashed else None
+    ).add_to(m)
+
+    if use_arrows:
+        try:
+            PolyLineTextPath(
+                polyline,
+                "▶",
+                repeat=True,
+                offset=8,
+                attributes={
+                    "fill": color,
+                    "font-weight": "bold",
+                    "font-size": "14"
+                }
+            ).add_to(m)
+        except Exception:
+            pass
+
 def build_vrp_nodes(
     decision_df,
     depot_lat,
@@ -1177,6 +1261,7 @@ def make_realtime_status_map(decision_df):
     return m
 
 
+
 def make_route_map(route_df, depot_lat, depot_lon, use_osrm_geometry=True):
     if route_df is None or len(route_df) == 0:
         return None
@@ -1209,39 +1294,58 @@ def make_route_map(route_df, depot_lat, depot_lon, use_osrm_geometry=True):
         group = group.sort_values("순서")
         color_line = route_colors[(int(vehicle_id) - 1) % len(route_colors)]
 
-        prev_lat = float(depot_lat)
-        prev_lon = float(depot_lon)
+        # =========================
+        # 차량별 전체 경로 좌표 생성
+        # =========================
+        ordered_points = [[float(depot_lat), float(depot_lon)]]
 
+        for _, row in group.iterrows():
+            ordered_points.append([float(row["위도"]), float(row["경도"])])
+
+        # =========================
+        # OSRM 호출은 차량 1대당 1번만 수행
+        # 실패하면 직선 화살표 경로로 자동 대체
+        # =========================
+        if use_osrm_geometry:
+            road_points = get_osrm_route_geometry_many(ordered_points)
+
+            if road_points is not None:
+                add_route_line_with_arrows(
+                    m,
+                    road_points,
+                    color=color_line,
+                    weight=5,
+                    opacity=0.75,
+                    use_arrows=True,
+                    dashed=False
+                )
+            else:
+                add_route_line_with_arrows(
+                    m,
+                    ordered_points,
+                    color=color_line,
+                    weight=4,
+                    opacity=0.55,
+                    use_arrows=True,
+                    dashed=True
+                )
+        else:
+            add_route_line_with_arrows(
+                m,
+                ordered_points,
+                color=color_line,
+                weight=4,
+                opacity=0.65,
+                use_arrows=True,
+                dashed=True
+            )
+
+        # =========================
+        # 마커 표시
+        # =========================
         for _, row in group.iterrows():
             cur_lat = float(row["위도"])
             cur_lon = float(row["경도"])
-
-            if use_osrm_geometry:
-                road_points = get_osrm_route_geometry(prev_lat, prev_lon, cur_lat, cur_lon)
-
-                if road_points is not None:
-                    folium.PolyLine(
-                        road_points,
-                        color=color_line,
-                        weight=5,
-                        opacity=0.75
-                    ).add_to(m)
-                else:
-                    folium.PolyLine(
-                        [[prev_lat, prev_lon], [cur_lat, cur_lon]],
-                        color=color_line,
-                        weight=4,
-                        opacity=0.45,
-                        dash_array="5, 5"
-                    ).add_to(m)
-            else:
-                folium.PolyLine(
-                    [[prev_lat, prev_lon], [cur_lat, cur_lon]],
-                    color=color_line,
-                    weight=4,
-                    opacity=0.65,
-                    dash_array="5, 5"
-                ).add_to(m)
 
             if row["작업"] == "수거":
                 marker_color = "#dc2626"
@@ -1319,9 +1423,6 @@ def make_route_map(route_df, depot_lat, depot_lon, use_osrm_geometry=True):
                 )
             ).add_to(m)
 
-            prev_lat = cur_lat
-            prev_lon = cur_lon
-
     return m
 
 
@@ -1345,39 +1446,58 @@ def make_single_vehicle_route_map(route_df, depot_lat, depot_lon, vehicle_id, us
         icon=folium.Icon(color="green", icon="home")
     ).add_to(m)
 
-    prev_lat = float(depot_lat)
-    prev_lon = float(depot_lon)
+    # =========================
+    # 차량별 전체 경로 좌표 생성
+    # =========================
+    ordered_points = [[float(depot_lat), float(depot_lon)]]
 
+    for _, row in vehicle_df.iterrows():
+        ordered_points.append([float(row["위도"]), float(row["경도"])])
+
+    # =========================
+    # OSRM 호출은 차량 1대당 1번만 수행
+    # 실패하면 직선 화살표 경로로 자동 대체
+    # =========================
+    if use_osrm_geometry:
+        road_points = get_osrm_route_geometry_many(ordered_points)
+
+        if road_points is not None:
+            add_route_line_with_arrows(
+                m,
+                road_points,
+                color="purple",
+                weight=5,
+                opacity=0.8,
+                use_arrows=True,
+                dashed=False
+            )
+        else:
+            add_route_line_with_arrows(
+                m,
+                ordered_points,
+                color="purple",
+                weight=4,
+                opacity=0.55,
+                use_arrows=True,
+                dashed=True
+            )
+    else:
+        add_route_line_with_arrows(
+            m,
+            ordered_points,
+            color="purple",
+            weight=4,
+            opacity=0.65,
+            use_arrows=True,
+            dashed=True
+        )
+
+    # =========================
+    # 마커 표시
+    # =========================
     for _, row in vehicle_df.iterrows():
         cur_lat = float(row["위도"])
         cur_lon = float(row["경도"])
-
-        if use_osrm_geometry:
-            road_points = get_osrm_route_geometry(prev_lat, prev_lon, cur_lat, cur_lon)
-
-            if road_points is not None:
-                folium.PolyLine(
-                    road_points,
-                    color="purple",
-                    weight=5,
-                    opacity=0.8
-                ).add_to(m)
-            else:
-                folium.PolyLine(
-                    [[prev_lat, prev_lon], [cur_lat, cur_lon]],
-                    color="purple",
-                    weight=4,
-                    opacity=0.45,
-                    dash_array="5, 5"
-                ).add_to(m)
-        else:
-            folium.PolyLine(
-                [[prev_lat, prev_lon], [cur_lat, cur_lon]],
-                color="purple",
-                weight=4,
-                opacity=0.65,
-                dash_array="5, 5"
-            ).add_to(m)
 
         if row["작업"] == "수거":
             marker_color = "#dc2626"
@@ -1397,6 +1517,15 @@ def make_single_vehicle_route_map(route_df, depot_lat, depot_lon, vehicle_id, us
         <b>방문 전 적재량:</b> {int(row.get('방문전_차량적재량', 0))}대<br>
         <b>방문 후 적재량:</b> {int(row.get('방문후_차량적재량', 0))}대<br>
         """
+
+        if "이동거리_km" in row:
+            popup_text += f"<b>이동거리:</b> {row.get('이동거리_km', '')} km<br>"
+
+        if "누적거리_km" in row:
+            popup_text += f"<b>누적거리:</b> {row.get('누적거리_km', '')} km<br>"
+
+        if "누적비용" in row:
+            popup_text += f"<b>누적비용:</b> {row.get('누적비용', '')}<br>"
 
         folium.Marker(
             location=[cur_lat, cur_lon],
@@ -1446,11 +1575,7 @@ def make_single_vehicle_route_map(route_df, depot_lat, depot_lon, vehicle_id, us
             )
         ).add_to(m)
 
-        prev_lat = cur_lat
-        prev_lon = cur_lon
-
     return m
-
 
 def make_vrp_input(decision_df):
     rows = []
@@ -1825,14 +1950,15 @@ elif view_mode == "실시간 경로 추천":
     )
 
     draw_road_route = st.checkbox(
-        "지도에 실제 도로 경로로 표시",
-        value=True
+        "가능하면 OSRM 도로 경로로 표시하고, 실패 시 직선 화살표 경로로 대체",
+        value=False
     )
 
     if route_method == "OSRM 도로망 거리 + OR-Tools VRP":
         st.info(
-            "OSRM은 별도 인증키 없이 테스트 가능하지만, 공개 서버는 대량 호출용이 아닙니다. "
-            "후보 수를 25개 이하로 유지하는 것이 좋습니다."
+            "OSRM 공개 서버는 대량 호출에 불안정할 수 있습니다. "
+            "이 대시보드는 OSRM 호출 실패 시 자동으로 직선거리 기반 화살표 경로로 대체합니다. "
+            "안정적인 시연을 위해 후보 수는 12개 이하, 차량별 방문 지점은 6개 이하를 권장합니다."
         )
 
     if "OR-Tools" in route_method and not ORTOOLS_AVAILABLE:
