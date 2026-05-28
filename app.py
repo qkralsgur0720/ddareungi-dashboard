@@ -997,6 +997,12 @@ def solve_ortools_vrp(
         start_load = int(initial_load_per_vehicle)
         capacity_dimension.CumulVar(start_index).SetRange(start_load, start_load)
 
+    for vehicle_id in range(int(vehicle_count)):
+        end_idx = routing.End(vehicle_id)
+        capacity_dimension.SetCumulVarSoftUpperBound(
+            end_idx, int(initial_load_per_vehicle), 10_000
+        )
+
     def visit_callback(from_index):
         from_node = manager.IndexToNode(from_index)
         return 0 if from_node == 0 else 1
@@ -1137,8 +1143,11 @@ def recommend_simple_route(
         total_distance = 0
 
         while step_no <= int(max_stops_per_vehicle):
-            if load > 0 and len(delivery_df) > 0 and len(delivery_df[delivery_df["남은배치량"] > 0]) > 0:
-                candidates = delivery_df[delivery_df["남은배치량"] > 0].copy()
+            pending_pickups = pickup_df[pickup_df["남은수거량"] > 0] if len(pickup_df) > 0 else pd.DataFrame()
+            pending_deliveries = delivery_df[delivery_df["남은배치량"] > 0] if len(delivery_df) > 0 else pd.DataFrame()
+
+            if load > 0 and len(pending_deliveries) > 0:
+                candidates = pending_deliveries.copy()
 
                 candidates["거리_km"] = candidates.apply(
                     lambda row: haversine_km(current_lat, current_lon, row["위도"], row["경도"]),
@@ -1178,8 +1187,8 @@ def recommend_simple_route(
                 current_lon = selected["경도"]
                 step_no += 1
 
-            elif load < int(vehicle_capacity) and len(pickup_df) > 0 and len(pickup_df[pickup_df["남은수거량"] > 0]) > 0:
-                candidates = pickup_df[pickup_df["남은수거량"] > 0].copy()
+            elif load < int(vehicle_capacity) and len(pending_pickups) > 0 and len(pending_deliveries) > 0:
+                candidates = pending_pickups.copy()
 
                 candidates["거리_km"] = candidates.apply(
                     lambda row: haversine_km(current_lat, current_lon, row["위도"], row["경도"]),
